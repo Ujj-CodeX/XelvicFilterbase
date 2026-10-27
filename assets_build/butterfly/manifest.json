@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "butterfly",
+  "name": "Butterfly",
+  "version": "1.0.0",
+  "description": "A luminescent morpho butterfly attached to the user's forehead",
+  "minimumRuntimeVersion": 1,
+  "thumbnail": "thumbnail.png",
+  "layers": [
+    {
+      "id": "main",
+      "asset": "assets/butterfly.png",
+      "anchor": "FOREHEAD_TOP",
+      "scaleMode": "FACE_WIDTH",
+      "scale": 0.85,
+      "offsetX": 0.0,
+      "offsetY": -0.15,
+      "rotationMode": "FACE_ROLL",
+      "rotationDegrees": 0.0,
+      "opacity": 1.0,
+      "zIndex": 0
+    }
+  ]
+}

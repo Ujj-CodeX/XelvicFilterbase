@@ -1,0 +1,6 @@
+{
+  "name": "Xelvic Camera Engine",
+  "description": "Native Android camera engine with real-time face tracking and dynamic .xfilter packages",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

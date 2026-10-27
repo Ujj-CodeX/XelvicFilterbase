@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "cat_face",
+  "name": "Cat Face",
+  "version": "1.0.0",
+  "description": "Playful 2D cat face with ears, nose, and whiskers",
+  "minimumRuntimeVersion": 1,
+  "thumbnail": "thumbnail.png",
+  "layers": [
+    {
+      "id": "ears",
+      "asset": "assets/cat_ears.png",
+      "anchor": "FOREHEAD_TOP",
+      "scaleMode": "FACE_WIDTH",
+      "scale": 0.76,
+      "offsetX": 0.0,
+      "offsetY": -0.14,
+      "rotationMode": "FACE_ROLL",
+      "rotationDegrees": 0.0,
+      "opacity": 1.0,
+      "zIndex": 0
+    },
+    {
+      "id": "nose",
+      "asset": "assets/cat_nose.png",
+      "anchor": "NOSE",
+      "scaleMode": "FACE_WIDTH",
+      "scale": 0.12,
+      "offsetX": 0.0,
+      "offsetY": 0.0,
+      "rotationMode": "FACE_ROLL",
+      "rotationDegrees": 0.0,
+      "opacity": 1.0,
+      "zIndex": 1
+    },
+    {
+      "id": "left_whiskers",
+      "asset": "assets/cat_whiskers_left.png",
+      "anchor": "LEFT_CHEEK",
+      "scaleMode": "FACE_WIDTH",
+      "scale": 0.34,
+      "offsetX": -0.04,
+      "offsetY": 0.0,
+      "rotationMode": "FACE_ROLL",
+      "rotationDegrees": 0.0,
+      "opacity": 1.0,
+      "zIndex": 2
+    },
+    {
+      "id": "right_whiskers",
+      "asset": "assets/cat_whiskers_right.png",
+      "anchor": "RIGHT_CHEEK",
+      "scaleMode": "FACE_WIDTH",
+      "scale": 0.34,
+      "offsetX": 0.04,
+      "offsetY": 0.0,
+      "rotationMode": "FACE_ROLL",
+      "rotationDegrees": 0.0,
+      "opacity": 1.0,
+      "zIndex": 2
+    }
+  ]
+}
