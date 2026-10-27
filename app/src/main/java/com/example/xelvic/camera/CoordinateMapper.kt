@@ -6,6 +6,8 @@ import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceLandmark
 import com.example.xelvic.model.FaceTrackingResult
 import kotlin.math.max
+import androidx.camera.view.TransformExperimental
+import androidx.camera.view.transform.CoordinateTransform
 
 /**
  * Handles precise mathematical coordinate transformation between
@@ -24,6 +26,9 @@ class CoordinateMapper {
      * @param previewHeight Target UI preview height in pixels.
      * @param isFrontCamera True if analyzing front-facing camera.
      */
+
+
+    @TransformExperimental
     fun mapFaceToPreview(
         face: Face,
         imageWidth: Int,
@@ -32,7 +37,10 @@ class CoordinateMapper {
         previewWidth: Int,
         previewHeight: Int,
         isFrontCamera: Boolean,
-        sourceTimestampMs: Long = System.currentTimeMillis()
+        sourceTimestampMs: Long = System.currentTimeMillis(),
+        coordinateTransform: CoordinateTransform? = null
+
+
     ): FaceTrackingResult {
         if (previewWidth <= 0 || previewHeight <= 0) {
             return FaceTrackingResult.EMPTY
@@ -46,36 +54,62 @@ class CoordinateMapper {
             return FaceTrackingResult.EMPTY
         }
 
-        // PreviewView uses ScaleType.FILL_CENTER (aspect fill, centered)
-        val scale = max(
-            previewWidth.toFloat() / uprightWidth.toFloat(),
-            previewHeight.toFloat() / uprightHeight.toFloat()
-        )
-        val scaledWidth = uprightWidth * scale
-        val scaledHeight = uprightHeight * scale
-        val dx = (previewWidth - scaledWidth) / 2f
-        val dy = (previewHeight - scaledHeight) / 2f
-
         // Helper point mapper
         fun mapPoint(x: Float, y: Float): PointF {
-            var mx = x * scale + dx
-            val my = y * scale + dy
-            if (isFrontCamera) {
-                mx = previewWidth - mx
+            val point = PointF(x, y)
+
+            if (coordinateTransform != null) {
+                coordinateTransform.mapPoint(point)
+                return point
             }
-            return PointF(mx, my)
+
+            // Fallback retained for startup/layout cases where the
+            // PreviewView transformation is not ready yet.
+            val scale = max(
+                previewWidth.toFloat() / uprightWidth.toFloat(),
+                previewHeight.toFloat() / uprightHeight.toFloat()
+            )
+
+            var mappedX =
+                x * scale +
+                        (previewWidth - uprightWidth * scale) / 2f
+
+            val mappedY =
+                y * scale +
+                        (previewHeight - uprightHeight * scale) / 2f
+
+            if (isFrontCamera) {
+                mappedX = previewWidth - mappedX
+            }
+
+            return PointF(mappedX, mappedY)
         }
 
         // Map Face Bounding Box
         val rawBox = face.boundingBox
-        val p1 = mapPoint(rawBox.left.toFloat(), rawBox.top.toFloat())
-        val p2 = mapPoint(rawBox.right.toFloat(), rawBox.bottom.toFloat())
-        val mappedBounds = RectF(
-            minOf(p1.x, p2.x),
-            minOf(p1.y, p2.y),
-            maxOf(p1.x, p2.x),
-            maxOf(p1.y, p2.y)
-        )
+
+        val mappedBounds = if (coordinateTransform != null) {
+            RectF(rawBox).apply {
+                coordinateTransform.mapRect(this)
+            }
+        } else {
+            val p1 = mapPoint(
+                rawBox.left.toFloat(),
+                rawBox.top.toFloat()
+            )
+
+            val p2 = mapPoint(
+                rawBox.right.toFloat(),
+                rawBox.bottom.toFloat()
+            )
+
+            RectF(
+                minOf(p1.x, p2.x),
+                minOf(p1.y, p2.y),
+                maxOf(p1.x, p2.x),
+                maxOf(p1.y, p2.y)
+            )
+        }
 
         // Map Landmarks
         val mappedLandmarks = mutableMapOf<String, PointF>()

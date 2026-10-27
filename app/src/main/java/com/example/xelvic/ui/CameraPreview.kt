@@ -75,7 +75,8 @@ fun CameraPreview(
     modifier: Modifier = Modifier,
     lensFacing: Int = CameraSelector.LENS_FACING_BACK,
     scaleType: PreviewView.ScaleType = PreviewView.ScaleType.FILL_CENTER,
-    implementationMode: PreviewView.ImplementationMode = PreviewView.ImplementationMode.PERFORMANCE,
+    implementationMode: PreviewView.ImplementationMode =
+        PreviewView.ImplementationMode.COMPATIBLE,
     onPreviewViewCreated: ((PreviewView) -> Unit)? = null,
     onSizeChanged: ((width: Int, height: Int) -> Unit)? = null
 ) {

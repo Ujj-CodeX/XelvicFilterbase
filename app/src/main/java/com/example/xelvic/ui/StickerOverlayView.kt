@@ -67,6 +67,14 @@ class TrackingOverlayView(context: Context) : View(context) {
 
     private val telemetryRect = RectF()
 
+
+    private var lastTrackingHadFace = false
+
+    // Prevents smoothing state from leaking across selected filters.
+    private var lastFilterIdentity: String? = null
+
+
+
     init {
         // Enable hardware acceleration for overlay drawing
         setLayerType(LAYER_TYPE_HARDWARE, null)
@@ -77,13 +85,36 @@ class TrackingOverlayView(context: Context) : View(context) {
 
         val holder = poseHolder ?: return
         val currentRenderer = renderer ?: return
-        val now = System.currentTimeMillis()
 
-        // 1. Get latest pose with bounded lead-time prediction
-        val trackingResult = holder.getLatestPose(now)
-
-        // 2. Render active filter if tracked
+        /*
+         * Do not compare the camera's source timestamp directly with
+         * System.currentTimeMillis().
+         *
+         * Camera timestamp clocks are not guaranteed to be comparable
+         * with the system wall clock on every device. Keep prediction
+         * disabled until we implement an explicit timestamp contract.
+         */
+        val trackingResult = holder.getLatestPose()
         val filter = selectedFilter
+
+        val filterIdentity = filter?.let {
+            "${it.id}:${it.definition.version}"
+        }
+
+        // Reset smoothing when face tracking is lost.
+        if (lastTrackingHadFace && !trackingResult.hasFace) {
+            currentRenderer.resetSmoothing()
+        }
+
+        // Reset smoothing when the active filter changes.
+        if (lastFilterIdentity != filterIdentity) {
+            currentRenderer.resetSmoothing()
+        }
+
+        lastTrackingHadFace = trackingResult.hasFace
+        lastFilterIdentity = filterIdentity
+
+        // Render only with a real, currently valid face-tracking result.
         if (filter != null && trackingResult.hasFace) {
             currentRenderer.render(
                 canvas = canvas,
@@ -93,12 +124,11 @@ class TrackingOverlayView(context: Context) : View(context) {
             )
         }
 
-        // 3. Render developer telemetry overlay if enabled
+        // Existing developer telemetry remains unchanged.
         if (showDebugOverlay) {
             drawDeveloperHUD(canvas, trackingResult)
         }
     }
-
     private fun drawDeveloperHUD(canvas: Canvas, trackingResult: com.example.xelvic.model.FaceTrackingResult) {
         val monitor = performanceMonitor
 

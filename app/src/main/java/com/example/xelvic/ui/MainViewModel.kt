@@ -95,10 +95,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val isFrontCamera = cameraController.isFrontCamera.value
 
                 // 2. Convert to upright Bitmap and close imageProxy
-                val uprightBitmap = withContext(Dispatchers.Default) {
-                    val bmp = photoProcessor.convertImageProxyToBitmap(imageProxy, isFrontCamera)
+                val uprightBitmap = try {
+                    withContext(Dispatchers.Default) {
+                        photoProcessor.convertImageProxyToBitmap(
+                            imageProxy,
+                            isFrontCamera
+                        )
+                    }
+                } finally {
+                    // Close even if coroutine cancellation prevents the
+                    // withContext block from starting or completing.
                     imageProxy.close()
-                    bmp
                 }
 
                 // 3. Process with selected filter
