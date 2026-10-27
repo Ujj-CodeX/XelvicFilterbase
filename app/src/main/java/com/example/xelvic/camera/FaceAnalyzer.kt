@@ -13,12 +13,20 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.atomic.AtomicBoolean
+import android.util.Log
+import androidx.camera.view.PreviewView
+import androidx.camera.view.TransformExperimental
+import androidx.camera.view.transform.CoordinateTransform
+import androidx.camera.view.transform.ImageProxyTransformFactory
+import androidx.camera.view.transform.OutputTransform
 
 /**
  * CameraX ImageAnalysis analyzer running on-device ML Kit Face Detection.
  * Includes concurrency guards against queue buildup, adaptive frequency throttling,
  * and performance metrics tracking.
  */
+
+@TransformExperimental
 class FaceAnalyzer(
     private val coordinateMapper: CoordinateMapper,
     val performanceMonitor: PerformanceMonitor,
@@ -34,6 +42,34 @@ class FaceAnalyzer(
 
     @Volatile
     var isFrontCamera: Boolean = true
+
+
+    @Volatile
+    var previewView: PreviewView? = null
+
+    @Volatile
+    private var cachedPreviewOutputTransform: OutputTransform? = null
+
+    @TransformExperimental
+    fun updatePreviewOutputTransform(transform: OutputTransform?) {
+        cachedPreviewOutputTransform = transform
+    }
+
+    private val imageProxyTransformFactory =
+        ImageProxyTransformFactory().apply {
+            setUsingCropRect(false)
+            setUsingRotationDegrees(true)
+        }
+
+    private val transformWarningLogged =
+        AtomicBoolean(false)
+
+    companion object {
+        private const val TAG = "FaceAnalyzer"
+    }
+
+
+
 
     // Guard preventing overlapping ML Kit inference Tasks
     private val isAnalyzing = AtomicBoolean(false)
@@ -81,6 +117,11 @@ class FaceAnalyzer(
         }
 
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+
+
+        val cameraCoordinateTransform = createCoordinateTransform(imageProxy)
+
+
         val frameTimestampMs = imageProxy.imageInfo.timestamp / 1_000_000L
         val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
         val startTime = SystemClock.elapsedRealtime()
@@ -102,7 +143,8 @@ class FaceAnalyzer(
                         previewWidth = previewWidth,
                         previewHeight = previewHeight,
                         isFrontCamera = isFrontCamera,
-                        sourceTimestampMs = frameTimestampMs
+                        sourceTimestampMs = frameTimestampMs,
+                        coordinateTransform = cameraCoordinateTransform
                     )
                     onFaceTracked(result)
                 } else {
@@ -119,6 +161,33 @@ class FaceAnalyzer(
                 // Mandatory CameraX requirement: Close every ImageProxy exactly once
                 imageProxy.close()
             }
+    }
+
+    @OptIn(TransformExperimental::class)
+    private fun createCoordinateTransform(
+        imageProxy: ImageProxy
+    ): CoordinateTransform? {
+        val targetTransform = cachedPreviewOutputTransform ?: return null
+
+        return try {
+            val sourceTransform =
+                imageProxyTransformFactory.getOutputTransform(imageProxy)
+
+            CoordinateTransform(
+                sourceTransform,
+                targetTransform
+            )
+        } catch (e: Exception) {
+            if (transformWarningLogged.compareAndSet(false, true)) {
+                Log.w(
+                    TAG,
+                    "Coordinate transform unavailable; using existing fallback",
+                    e
+                )
+            }
+
+            null
+        }
     }
 
     fun release() {
