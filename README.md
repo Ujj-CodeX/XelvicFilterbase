@@ -1,288 +1,526 @@
 # Xelvic Camera Engine
 
-A native Android camera engine featuring real-time face tracking and a dynamic, data-driven 2D filter package architecture (`.xfilter`).
+**Xelvic** is a native Android camera and face-effects engine. The existing baseline uses CameraX, on-device ML Kit Face Detection, a data-driven `.xfilter` package format, and a Canvas-based 2D sticker renderer. The dedicated research direction is a **mesh-first face-effects engine**: persistent face tracking, UV-mapped 2D textures on a live 3D face surface, GPU rendering, and depth-based face occlusion.
 
----
+> **Status notice:** This README deliberately separates the existing codebase from the planned Mesh Engine R&D work. MediaPipe integration, the GPU mesh renderer, mesh-texture schema extensions, learned dynamic rigidity, and occlusion must not be treated as implemented or validated until the corresponding branch code and tests exist. Physical-device performance figures are marked `NOT MEASURED` until measured.
 
-## 1. Core Architecture
+## Goals
 
-Xelvic treats all augmented reality face overlays as external, self-contained packages rather than hardcoded effects. The rendering engine contains zero filter-specific conditionals, coordinates, or behaviors.
+- Keep the production baseline isolated while research is developed on a dedicated branch.
+- Use a persistent tracking session: switching an effect must not restart the camera or face tracker.
+- Reuse static mesh topology, UV data, validated assets, and cached textures; update live vertex positions as tracking results arrive.
+- Render 2D PNG/WebP artwork as a texture on the tracked face surface—not only as a flat rectangle positioned at a few landmarks.
+- Establish a correct coordinate/projection contract across camera input, tracked geometry, preview, GL rendering, and still-photo output.
+- Design for future depth-based face occlusion and, separately, hand/scene occlusion.
+- Measure latency, jitter, memory, frame drops, texture-switch hitches, and thermal behaviour on physical devices.
+- Keep face images, landmarks, blendshapes, and mesh data on-device by default. Do not upload or persist face data unless a separately reviewed feature explicitly requires it.
 
-### Component Responsibilities
+## Technology Baseline
 
-- **`MainActivity`**: Host Activity, edge-to-edge layout, lifecycle management, SAF file-picker dispatch, and runtime permissions (`CAMERA`).
-- **`CameraController`**: CameraX lifecycle binder connecting `Preview`, `ImageAnalysis` (with `STRATEGY_KEEP_ONLY_LATEST`), and `ImageCapture` use cases with lens flipping and flash modes.
-- **`FaceAnalyzer`**: Asynchronous `ImageAnalysis.Analyzer` passing camera frames off the main thread to on-device ML Kit Face Detection, guaranteeing proper `ImageProxy` disposal.
-- **`CoordinateMapper`**: Handles coordinate geometry between sensor buffers, ML Kit upright detection spaces, and `PreviewView` (handling aspect fill-crop, orientation, and front-camera mirroring).
-- **`FilterPackageManager`**: Handles atomic extraction, validation, and storage of `.xfilter` archives. Implements strict ZIP Slip and path traversal defenses, size limits, and manifest verification.
-- **`FilterRepository`**: Single source of truth managing installed filters, active selection, and memory caching of bitmaps.
-- **`StickerRenderer`**: Generic 2D renderer calculating layer position, scaling (`FACE_WIDTH`, `FACE_HEIGHT`, `EYE_DISTANCE`), normalized offsets, rotation (`FACE_ROLL`, `EYE_LINE`, `FIXED`), opacity, and per-layer EMA jitter suppression.
-- **`PhotoProcessor`**: Obtains full-resolution photographs from `ImageCapture`, runs face detection on the captured photo coordinate system, and composites all active filter layers directly into the photo.
-- **`MediaStoreSaver`**: Persists processed photographs to the Android device gallery under `Pictures/Xelvic` using modern `MediaStore` APIs.
-- **`PhotoReviewScreen`**: Dedicated review interface supporting **Retake** (discards capture and immediately resumes live camera tracking) and **Save Photo**.
+The current repository version catalog/configuration lists the following baseline versions. Verify the checked-out files before changing versions; do not upgrade dependencies as an incidental part of the mesh implementation.
 
----
+| Component | Version / setting in the current repository |
+|---|---|
+| Android Gradle Plugin | `9.1.1` |
+| Kotlin | `2.2.10` |
+| CameraX core / camera2 / lifecycle / view | `1.5.0` |
+| ML Kit Face Detection | `16.1.7` |
+| `compileSdk` | API 36 (minor API level 1 in the current Gradle configuration) |
+| `minSdk` | API 24 (Android 7.0) |
+| Application ID | `com.aistudio.xelvic.krvpmz` |
+| Namespace | `com.example` |
 
-## 2. `.xfilter` Package Specification
+MediaPipe Face Landmarker is **not assumed to be integrated in the baseline**. During R0, select a compatible Tasks Vision dependency and model asset, pin the chosen version, verify Android/ABI support, and record the exact versions in the R&D branch before integrating it.
 
-An `.xfilter` package is a ZIP-compatible archive containing:
+## Current Baseline vs. Mesh Engine R&D
+
+| Area | Existing baseline (repository code) | Mesh Engine R&D target |
+|---|---|---|
+| Camera | CameraX `Preview`, `ImageAnalysis`, and `ImageCapture` | Keep CameraX input; decide preview/GL composition after a focused technical spike |
+| Face tracking | ML Kit Face Detection with sparse landmarks and pose angles | MediaPipe Face Landmarker adapter producing dense 3D landmarks and optional blendshapes/transformation matrix |
+| Face representation | `FaceTrackingResult` with bounds, named `PointF` landmarks, roll/yaw, timestamp | Immutable timestamped geometry snapshot with vertices, validated topology/UV reference, pose, optional blendshapes, and tracking status |
+| 2D effects | Generic Canvas `StickerRenderer`; PNG/WebP layers anchored to face points | GPU mesh-texture renderer for face-surface effects; retain Canvas for legacy/unsupported effects |
+| Filter package | `.xfilter` schema v1 | Backward-compatible schema extension after texture/mesh contract is proven |
+| Occlusion | No general mesh depth-occlusion pipeline is assumed | Face depth pre-pass first; hand/scene occlusion as a separate later project |
+| Performance | Existing frame dropping/adaptive analysis controls and bitmap caches | Reuse persistent tracking state, static geometry, textures and GPU buffers; profile before choosing optimizations |
+| Research algorithms | Not present just because they appear in this README | Optical flow and learned dynamic rigidity are separate research items, not automatic MediaPipe features |
+
+`main` is the production baseline. R&D work belongs on `research/face-mesh-texture-occlusion` and should be merged only after validation and review.
+
+## Repository Architecture
+
+### Existing live camera path
+
+```text
+CameraX
+  ├─ Preview ───────────────────────────────────> PreviewView
+  ├─ ImageAnalysis (KEEP_ONLY_LATEST)
+  │    └─ FaceAnalyzer (background executor)
+  │         └─ ML Kit Face Detection
+  │              └─ CoordinateMapper
+  │                   └─ FaceTrackingResult
+  │                        └─ TrackingPoseHolder (latest tracking state)
+  │                             └─ TrackingOverlayView (VSYNC invalidation)
+  │                                  └─ StickerRenderer (Android Canvas)
+  └─ ImageCapture
+       └─ PhotoProcessor
+            └─ MediaStoreSaver
+                 └─ Pictures/Xelvic
 ```
-cat_face.xfilter
-├── manifest.json
-├── thumbnail.png
-└── assets/
-    ├── cat_ears.png
-    ├── cat_nose.png
-    ├── cat_whiskers_left.png
-    └── cat_whiskers_right.png
+
+The actual source should always be checked before assuming a particular lifecycle, viewport, cancellation, or transform fix exists in a newly cloned checkout. In particular, camera use-case crop alignment, transform access thread, and image-resource ownership must be verified in code and on a device.
+
+### Intended Mesh Engine path
+
+```text
+CameraX frame input
+  ├─ Native PreviewView path (baseline / fallback)
+  └─ GL frame path (preferred only if a reusable, validated camera-to-GL path exists)
+       │
+       ▼
+FaceGeometryProvider
+  └─ MediaPipe Face Landmarker adapter (LIVE_STREAM for live input)
+       │  timestamps; vertices/landmarks; optional blendshapes and pose matrix
+       ▼
+Immutable FaceGeometrySnapshot ──> latest-snapshot handoff
+       │
+       ├─ Coordinate + projection module
+       │    sensor/buffer → oriented analysis image → normalized landmarks
+       │    → canonical face space / tracked face space → camera projection
+       │    → preview crop/display space or GL Normalized Device Coordinates (NDC)
+       │
+       └─ EffectDefinition + validated assets
+            └─ Renderer capability/tier router
+                 ├─ FaceMeshRenderer (primary R&D target)
+                 │    ├─ static topology + UVs reused
+                 │    ├─ live vertices updated from tracking
+                 │    ├─ PNG/WebP texture sampling and mask/alpha handling
+                 │    └─ optional face-depth pre-pass for virtual-effect occlusion
+                 └─ Legacy Canvas StickerRenderer (compatibility fallback)
 ```
 
-### Manifest Schema (`cat_face.xfilter / manifest.json`)
+The GL composition approach is a decision gate, not an already completed implementation:
+
+- **Path A — transparent GL surface above `PreviewView`:** simplest way to prototype mesh graphics while preserving CameraX's native preview. It can have some preview/overlay timing mismatch and does not provide a single pixel-processing scene for blur or colour-grade effects.
+- **Path B — camera frame and effects in one GL scene:** potentially better synchronisation and a reusable path for pixel effects/video, but it adds camera-texture import, synchronisation, lifecycle, GPU-resource and device-compatibility work.
+
+Investigate whether a proven camera-to-GL path can be reused. If not, start with Path A for wireframe/texture proof-of-concept, keep the renderer interface independent of the surface, and measure synchronisation before choosing a production composition path.
+
+## Component Responsibilities
+
+### Existing code
+
+- **`MainActivity`** — Activity/Compose host, lifecycle, permissions and user-facing flow.
+- **`CameraController`** — CameraX lifecycle binding, front/rear camera, flash, and photo capture.
+- **`FaceAnalyzer`** — current ML Kit `ImageAnalysis.Analyzer`; protects against overlapping inference and closes every `ImageProxy` exactly once.
+- **`CoordinateMapper`** — current face-coordinate mapping for the preview or captured-photo coordinate system.
+- **`FaceTrackingResult`** — current sparse face bounds, named landmarks, orientation and timestamp.
+- **`TrackingPoseHolder`** — keeps the latest tracking result available to the overlay.
+- **`StickerRenderer`** — current Canvas renderer for generic `.xfilter` layers and per-layer smoothing.
+- **`FilterPackageManager`** — imports/validates `.xfilter` archives.
+- **`FilterRepository` / `InstalledFilter`** — active filter selection, installed filter metadata and decoded-asset access.
+- **`PhotoProcessor`** — processes the captured photograph with the active effect.
+- **`MediaStoreSaver`** — stores processed photos in the gallery.
+
+### New R&D components (proposed, not assumed to exist yet)
+
+- **`FaceGeometryProvider`** — interface separating the renderer from a specific tracking SDK.
+- **`MediaPipeFaceGeometryProvider`** — MediaPipe implementation with explicit lifecycle and live-stream timestamp handling.
+- **`FaceGeometrySnapshot`** — immutable snapshot of one coherent result; no arrays/maps should be mutated after publication.
+- **`CoordinateProjection`** — owns all named-space transforms, mirroring rules, crop handling and GL projection assumptions.
+- **`EffectDefinition`** — validated, renderer-independent effect description derived from a package manifest.
+- **`OverlayRenderer`** — common renderer interface for Canvas and mesh-based backends.
+- **`FaceMeshRenderer`** — GL-based mesh, UV texture, masks and depth pass.
+- **`RendererTierRouter`** — chooses a compatible renderer for a filter and device capabilities; the mesh engine remains the target for mesh effects, while Canvas is a legacy/compatibility path.
+- **`TextureCache`** — bounded LRU cache with background decode and GL-thread-only texture upload/deletion.
+- **`ReplayHarness`** — local test-only frame/result playback for deterministic regression tests.
+
+Names above are suggested architecture names; they should be aligned with existing conventions before adding files.
+
+## Face Geometry, Pose, and Temporal Stability
+
+### Do not rebuild the whole mesh on every frame
+
+The topology (triangle index list), compatible UV layout, canonical reference data, and validated texture assets are static per supported model/effect. Cache these. For each accepted tracking result, update the live vertex positions and per-frame pose/expression state. Reuse GPU buffers where supported and update only the data that actually changed.
+
+This does **not** mean freezing the face mesh: live vertices must continue to follow head motion and expressions. It means avoiding repeated allocation/reconstruction of immutable mesh data.
+
+### Track continuously and switch effects independently
+
+- Keep the camera session and face-tracking provider alive during ordinary filter changes.
+- Replace the active `EffectDefinition` and required material/texture state without reinitialising the tracker.
+- Preload/decode candidate textures off the UI/GL thread; upload them on the GL render thread.
+- Cache static topology, UV layout and recently used textures under explicit memory limits.
+- On a topology/model mismatch, reject the incompatible texture/effect or route to a compatible renderer; never silently use incorrect vertex indices.
+- A lost face is different from a filter switch. Face-loss recovery may require relocalisation/re-detection, but selecting a new filter should not trigger it by itself.
+
+### Smoothing, pose prediction, and expression handling
+
+1. Keep strict monotonic timestamps and reject stale results before publishing them to the renderer.
+2. Filter translation, rotation and scale as distinct quantities. Do not independently low-pass all 4×4 matrix entries; it can introduce invalid shear or non-rigid transformations.
+3. Represent rotation appropriately (for example, a quaternion) and use spherical interpolation where suitable. Smooth local expression/blendshape values independently from rigid head pose.
+4. If render-time prediction is added, use a measured, bounded prediction horizon and a validated timestamp clock contract. Do not compare camera timestamps to unrelated wall-clock timestamps.
+5. Test expression motion separately from filter switching.
+
+**Learned dynamic rigidity is a separate R&D item.** Snap's 2018 paper describes a region-based dynamic rigidity prior, rigid-pose/expression optimisation, landmarks and dense optical flow to reduce ambiguity between head rotation and facial deformation. MediaPipe does not automatically provide Snap's learned prior. First benchmark the built-in Face Landmarker temporal tracking, transformation matrix and blendshapes; investigate optical flow and learned rigidity only when measured pose instability remains and the extra compute/data/training cost is justified.
+
+## Coordinate and Projection Contract (P0)
+
+Coordinate bugs are a high-risk part of this project. Every geometry snapshot and renderer API must state which coordinate space it uses.
+
+Required stages to document and validate:
+
+1. Camera sensor / `ImageProxy` buffer pixels.
+2. Rotation metadata and the oriented analysis-image space used by the tracker.
+3. Tracker output normalised landmark coordinates (and the coordinate convention used for Z).
+4. Canonical face geometry and its UV/topology version.
+5. Runtime face geometry and the returned facial transformation matrix.
+6. Camera projection: its assumptions, aspect ratio, units, handedness and matrix convention must match the geometry being rendered.
+7. PreviewView crop/scale/rotation and layout mapping, or the single-scene GL projection.
+8. GL clip space / NDC and final viewport mapping.
+9. Front-camera mirroring: apply it in one explicitly owned stage, never twice.
+10. Still-photo coordinate space: computed independently from the captured image and mapped to its final output dimensions.
+
+Do not assume that a model's transformation matrix is automatically a correct projection matrix. Verify the canonical-to-runtime transform and the camera projection separately. Occlusion depends on consistent depth scale/direction and correct depth-buffer conventions; XY alignment alone is insufficient.
+
+For CameraX, prefer a shared `ViewPort`/`UseCaseGroup` where the chosen use cases and lifecycle allow it, but verify actual API behaviour, `PreviewView` transforms and physical-device results. UI view properties must only be read from the correct thread; do not query `PreviewView.outputTransform` directly on the camera analysis executor.
+
+## Mesh Topology and Texture Mapping
+
+MediaPipe Face Landmarker currently documents 478 3D landmarks and can optionally return 52 blendshape scores and a facial transformation matrix. These are model outputs, not a guarantee that any arbitrary 478-index triangle list/UV map is valid.
+
+Before mesh rendering:
+
+- Select and pin a specific compatible model/task version for the R&D branch.
+- Verify landmark ordering, canonical mesh topology, triangle index list, UV coordinates, vertex count, and matrix convention against that exact model/reference data.
+- Do not blindly combine the 478-landmark task result with an older 468-vertex canonical topology. Iris landmarks and face-surface topology require explicit compatibility handling.
+- Keep topology and UV data versioned and cached; update live vertex buffers per tracking result.
+- Use a test texture/wireframe to validate every transform before enabling production effects.
+
+### Renderer-specific geometry
+
+- **Face-paint / skin texture:** canonical face UV mapping with region masks and live deforming surface vertices.
+- **Local 2D decoration:** map onto a defined mesh region/patch or use a face-attached sprite/geometry; a random transparent PNG is not automatically a full-face UV texture.
+- **Rigid 3D prop (hat, glasses frame, horns, etc.):** attach to validated face pose/anchors; use the proper model transform rather than deforming the whole model like skin.
+- **Face occluder:** draw a live face surface to the depth buffer with a consistent projection/depth convention.
+
+### Texture boundary requirements
+
+- Define UV layout and region-mask semantics.
+- Handle eye sockets, eyelids/iris, lips, and mouth interior to avoid texture spilling over eye whites or into the mouth when blinking/speaking.
+- Support alpha correctly, including premultiplied-alpha conventions where the renderer uses them.
+- Evaluate mipmaps/minification and edge feathering to reduce visible seams.
+- Validate texture dimensions, decoded pixel count, file type and total package size before allocation/upload.
+- Avoid unbounded decoded-bitmap and GPU-texture caches. Define an LRU budget and release GL resources on the GL thread.
+
+## Effect Definition and `.xfilter` Compatibility
+
+### Existing `.xfilter` schema v1
+
+The current schema describes 2D layers with fields such as:
+
+- `id`, `name`, `version`, `description`, `thumbnail`
+- `layers[]`: `id`, `asset`, `anchor`, `scaleMode`, `scale`, `offsetX`, `offsetY`, `rotationMode`, `rotationDegrees`, `opacity`, and `zIndex`
+- Current anchors include face center, forehead top, eye centre, left/right eyes, nose, mouth, and left/right cheek.
+- Current scale modes include `FACE_WIDTH`, `FACE_HEIGHT`, and `EYE_DISTANCE`.
+- Current rotation modes include `FACE_ROLL`, `EYE_LINE`, and `FIXED`.
+
+Existing schema v1 packages should remain readable and continue to render through the Canvas compatibility renderer unless they explicitly meet the newer mesh-effect contract.
+
+### Proposed schema v2 extension (design only)
+
+The following is a concept, not accepted syntax in the current parser or package validator. Final field names and validation rules must be implemented and tested before authoring v2 packages.
 
 ```json
 {
-  "schemaVersion": 1,
-  "id": "cat_face",
-  "name": "Cat Face",
+  "schemaVersion": 2,
+  "id": "sample_face_paint",
+  "name": "Sample Face Paint",
   "version": "1.0.0",
-  "description": "Playful 2D cat face with ears, nose, and whiskers",
-  "minimumRuntimeVersion": 1,
-  "thumbnail": "thumbnail.png",
-  "layers": [
-    {
-      "id": "ears",
-      "asset": "assets/cat_ears.png",
-      "anchor": "FOREHEAD_TOP",
-      "scaleMode": "FACE_WIDTH",
-      "scale": 0.76,
-      "offsetX": 0.0,
-      "offsetY": -0.14,
-      "rotationMode": "FACE_ROLL",
-      "rotationDegrees": 0.0,
-      "opacity": 1.0,
-      "zIndex": 0
-    },
-    {
-      "id": "nose",
-      "asset": "assets/cat_nose.png",
-      "anchor": "NOSE",
-      "scaleMode": "FACE_WIDTH",
-      "scale": 0.12,
-      "offsetX": 0.0,
-      "offsetY": 0.0,
-      "rotationMode": "FACE_ROLL",
-      "rotationDegrees": 0.0,
-      "opacity": 1.0,
-      "zIndex": 1
-    },
-    {
-      "id": "left_whiskers",
-      "asset": "assets/cat_whiskers_left.png",
-      "anchor": "LEFT_CHEEK",
-      "scaleMode": "FACE_WIDTH",
-      "scale": 0.34,
-      "offsetX": -0.04,
-      "offsetY": 0.0,
-      "rotationMode": "FACE_ROLL",
-      "rotationDegrees": 0.0,
-      "opacity": 1.0,
-      "zIndex": 2
-    },
-    {
-      "id": "right_whiskers",
-      "asset": "assets/cat_whiskers_right.png",
-      "anchor": "RIGHT_CHEEK",
-      "scaleMode": "FACE_WIDTH",
-      "scale": 0.34,
-      "offsetX": 0.04,
-      "offsetY": 0.0,
-      "rotationMode": "FACE_ROLL",
-      "rotationDegrees": 0.0,
-      "opacity": 1.0,
-      "zIndex": 2
-    }
-  ]
+  "minimumRuntimeVersion": 2,
+  "renderer": "FACE_MESH_TEXTURE",
+  "meshTexture": {
+    "asset": "assets/face_paint.png",
+    "uvLayout": "pinned-canonical-face-layout-id",
+    "blendMode": "NORMAL",
+    "opacity": 1.0,
+    "regionMask": "assets/face_region_mask.png"
+  }
 }
 ```
 
-### Coordinate and Face-Relative Sizing Conventions
+The future package-to-render flow should be:
 
-- **Face-Relative Sizing Rules**:
-  - `FACE_WIDTH`: Layer width = Detected face bounding box width × `scale`.
-  - `FACE_HEIGHT`: Layer width = Detected face bounding box height × `scale`.
-  - `EYE_DISTANCE`: Layer width = Distance between eyes × `scale`.
-  - Layer height automatically preserves the source image asset's original aspect ratio.
-  - Sizing targets for Cat Face:
-    - **Both ears combined**: ~76% of face width (`scale: 0.76`), positioned above the forehead with `FOREHEAD_TOP` anchor and normalized offset `offsetY: -0.14`.
-    - **Cat nose**: ~12% of face width (`scale: 0.12`), anchored directly to `NOSE` (ML Kit nose tip landmark).
-    - **Whiskers**: ~34% of face width each (`scale: 0.34`), anchored to `LEFT_CHEEK` and `RIGHT_CHEEK` with gentle lateral offsets (`offsetX: ±0.04`).
-- **Normalized Offsets (`offsetX` / `offsetY`)**:
-  - Offsets are expressed as fractions of detected face width and height, adapting dynamically as the face moves closer to or farther from the lens.
-- **Supported Anchors**:
-  - `FOREHEAD_TOP`: Derived midpoint above the eye line towards the upper face boundary.
-  - `EYES_CENTER`: Mathematical midpoint between the left and right eyes.
-  - `FACE_CENTER`: Center of the face bounding box.
-  - `LEFT_EYE` / `RIGHT_EYE`: ML Kit landmark eye positions.
-  - `NOSE`: Nose base landmark.
-  - `MOUTH`: Mouth bottom landmark.
-  - `LEFT_CHEEK` / `RIGHT_CHEEK`: Cheek landmarks.
-- **Rotation Modes**:
-  - `FACE_ROLL`: Rotates with the head's Euler Z roll angle.
-  - `EYE_LINE`: Rotates with the geometric angle between the left and right eyes.
-  - `FIXED`: Fixed angle independent of face tilt.
-
----
-
-## 3. Security and Package Validation
-
-The `FilterPackageManager` enforces strict controls on all incoming `.xfilter` archives:
-1. **ZIP Slip & Path Traversal Prevention**: Every entry path is verified to resolve strictly within the target extraction directory (`canonicalPath.startsWith(destination.canonicalPath)`). Any relative `..`, absolute `/`, or backslash paths are rejected.
-2. **Resource Boundaries**:
-   - Maximum archive size: 25 MB
-   - Maximum entry count: 100 files
-   - Maximum uncompressed extraction size: 50 MB
-   - Allowed file extensions: `.json`, `.png`, `.webp` (executable `.dex`, `.jar`, `.so`, `.sh` are strictly prohibited).
-3. **Atomic Installation**: Packages extract to an isolated temporary directory `.tmp_extract_*`, validate manifest syntax and required assets, and atomically rename upon verification.
-
----
-
-## 4. How to Build & Run in Android Studio
-
-1. Open Android Studio and select **File > Open**, navigating to the project directory.
-2. Allow Gradle to sync dependencies.
-3. Connect an Android device running Android 7.0 (API 24) or newer with USB debugging enabled.
-4. Press **Run** (`Shift + F10`) to build and deploy the application.
-5. Grant camera permission on the device:
-   - Select **Cat Face** or **Butterfly** in the bottom carousel to see the filter track your facial movements.
-   - Switch between front and rear cameras using the top-bar flip button.
-   - Tap the shutter button to capture a full-resolution photograph with all layers composited.
-   - Tap **Retake** to return to the live camera feed, or tap **Save Photo** to save the processed image to `Pictures/Xelvic`.
-
----
-
-## 5. High-Performance Three-Loop Architecture
-
-To prevent frame drops, stutter, and thermal throttling on mid-range and low-end Android devices, Xelvic decouples the camera preview pipeline into three independent asynchronous execution loops:
-
-```
-┌────────────────────────────────────────────────────────┐
-│ 1. DISPLAY LOOP (CameraX Preview)                      │
-│ - Hardware-accelerated SurfaceView/TextureView         │
-│ - Driven directly by Android GraphicBuffer/HAL         │
-│ - Fixed 30/60 fps display pacing; never blocked by ML  │
-└────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ 2. TRACKING LOOP (ImageAnalysis + ML Kit)             │
-│ - Independent Background Executor                      │
-│ - 480p target resolution (optimal for face detection)  │
-│ - AtomicBoolean in-flight lock (no queue buildup)      │
-│ - AdaptivePerformanceController frame throttling       │
-│ - Publishes latest pose to TrackingPoseHolder          │
-└────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ 3. OVERLAY RENDERING LOOP (TrackingOverlayView)        │
-│ - Hardware-accelerated custom android.view.View        │
-│ - Decoupled from Jetpack Compose recomposition        │
-│ - Redraws on VSYNC via postInvalidateOnAnimation()     │
-│ - OneEuroFilter smoothing (X, Y, Scale, Rotation)      │
-│ - Zero per-frame allocations on hot draw path          │
-└────────────────────────────────────────────────────────┘
+```text
+.xfilter archive
+  → secure extraction to temporary directory
+  → schema/version validation
+  → asset path + file signature + dimension/pixel + package-budget validation
+  → UV/topology/effect compatibility validation
+  → immutable EffectDefinition
+  → renderer capability/tier selection
+  → background decode + GL-thread texture upload
+  → active effect swap (tracker remains running)
 ```
 
-### Why Compose Recomposition Was Eliminated from the Tracking Loop
+Keep ZIP Slip/path traversal prevention, strict archive/extraction limits, allow-listed asset types, and transactional installation. If adding texture/image types or higher texture sizes, update the security limits/tests deliberately; do not weaken validation as a side effect of supporting meshes.
 
-In naive Compose camera overlays, tracking state is published as `StateFlow<FaceTrackingResult>`. Reading this flow inside a composable function forces the Compose runtime to re-execute recomposition, layout measurement, and modifier passes at 30+ frames per second. Even small recompositions trigger noticeable GC pauses, UI thread jank, and battery drain.
+## Preview vs. Still Photo
 
-In Xelvic:
-- The UI layer (shutter button, flash toggle, filter carousel) remains in Jetpack Compose, updating **only** on user interaction or state changes (e.g., face detection state `isFaceLocked`).
-- High-frequency tracking coordinates bypass the Compose node tree completely: `TrackingPoseHolder` updates an `AtomicReference`, which triggers an invalidated draw pass on `TrackingOverlayView` via Android's native hardware-accelerated canvas.
+### Live preview
 
----
+- CameraX owns camera acquisition.
+- Decide between native `PreviewView` plus transparent GL overlay and a single GL camera/effects scene using the composition decision gate above.
+- Keep rendering asynchronous from UI recomposition and pass complete, immutable tracking snapshots to the render loop.
+- Use the latest valid snapshot; drop stale frames rather than building an unbounded queue.
 
-## 6. One-Euro (1€) Filter Smoothing & Tuning
+### Photo capture
 
-Xelvic uses an adapted 1€ filter (Casiez et al., CHI 2012) for position, scale, and angular smoothing. The filter dynamically computes cutoff frequency:
-$$\hat{x} = \alpha x + (1 - \alpha) x_{\text{prev}}, \quad f_c = \text{minCutoff} + \beta \cdot |\hat{dx}|$$
+Do not blindly reuse the preview pose/mesh as the authoritative geometry for a still. The shutter captures at a different time and resolution.
 
-- **`minCutoff` (default: 1.0 Hz)**: Determines filtering strength when the face is stationary. Lower values suppress camera sensor noise and facial micro-tremors.
-- **`beta` (default: 0.02)**: Determines velocity scaling. When the user tilts or turns their head quickly, the cutoff frequency increases proportionally to eliminate perceptible lag.
-- **`dCutoff` (default: 1.0 Hz)**: Derivative cutoff frequency to smooth velocity estimates.
+1. Capture the photo through `ImageCapture`.
+2. Run a fresh still-image face inference using the image/still mode on a background worker. A downsampled copy may be used for inference, but retain the transform needed to map detected coordinates back to the full-resolution image.
+3. Apply the same validated `EffectDefinition` and matching mesh/UV convention to the newly detected geometry.
+4. Use an offscreen rendering path that is designed and tested for still images; if GL is used, define EGL/context sharing and resource lifecycle explicitly. A CPU fallback may be needed for incompatible devices or a simpler effect.
+5. Define no-face behaviour: save without effect, ask to retake, or expose a controlled retry. Do not leave this unspecified.
+6. Match camera crop/aspect and front-camera mirror policy deliberately; do not assume preview and capture have identical pixels solely because they share a lifecycle.
+7. Bound photo bitmap and texture memory. A large RGBA texture can consume tens of megabytes; downsample/limit texture assets as appropriate and verify peak memory on real devices.
 
-### Angular Wraparound Handling
-To prevent 358° spin glitches when roll angle crosses the $\pm 180^\circ$ boundary:
-```kotlin
-val delta = normalizeAngle(target - prevAngle) // wraps delta to [-180, +180]
-val smoothed = normalizeAngle(prevAngle + alpha * delta)
+Preview and still rendering should share the same effect definition and geometry conventions, but they do not have to reuse the same per-frame tracking result.
+
+## Threads and Resource Ownership
+
+Thread ownership is part of the architecture, not an implementation afterthought.
+
+| Work | Owner / rule |
+|---|---|
+| View lifecycle, `PreviewView` properties and UI state | Android main thread |
+| CameraX `ImageAnalysis` delivery | Dedicated analysis executor; close every `ImageProxy` exactly once |
+| MediaPipe live-stream inference | Dedicated/background execution as required by the SDK; supply valid monotonic frame timestamps |
+| Result publication | Atomic reference or another bounded, safe latest-snapshot handoff; publish complete immutable snapshots |
+| OpenGL calls, texture upload/deletion and mesh-buffer updates | GL render thread/context only |
+| Image/texture decoding and archive validation | Background worker; do not block UI or GL thread |
+| Photo inference and offscreen compositing | Background worker plus a correctly owned offscreen rendering context when required |
+
+Additional rules:
+
+- Avoid concurrent mutation of vertex arrays after publication.
+- Preload/cache before switching where possible, but never perform texture upload on the UI thread.
+- Handle activity pause/resume, camera unbind, surface recreation and GL context loss. GPU resources may need recreation after context loss.
+- If offscreen photo rendering shares GL resources with preview, define and test EGL context sharing; do not assume it works automatically.
+- Ensure the old effect's texture/mesh resources are released safely without invalidating work currently queued on the GL thread.
+
+## Low-End Device Strategy
+
+Low-end support must be measured throughout development rather than added at the end.
+
+- Start with one face and a single tracking provider.
+- Use MediaPipe's live-stream tracking behaviour and a latest-frame policy where appropriate; don't run ML Kit and MediaPipe on every frame simultaneously in the production path.
+- Cache topology, UVs and textures; reuse buffers and avoid per-frame bitmap conversion/allocation where possible.
+- Keep face analysis resolution independent of preview resolution and choose it using benchmark results.
+- Consider reducing inference cadence, texture resolution, shader complexity and nonessential effects under load. Keep the camera display path responsive.
+- Separate measurement of inference latency, render GPU time, frame age, dropped frames, memory and thermal behaviour.
+- Treat RGBA conversion as a benchmark candidate, not an assumed optimisation: CameraX documents extra conversion overhead for `RGBA_8888` and `NV21` output compared with the default YUV path. Investigate `PRIVATE`/GPU-oriented buffers only if the CameraX version, device support and model input path make that feasible.
+- Do not promise fixed FPS or zero latency before physical-device profiling.
+
+Suggested reporting fields (no result should be marked verified until measured):
+
+- device model, Android version, app/build variant, model asset version
+- tracking inference p50/p95, render GPU p50/p95, result age at render
+- dropped/stale frames, filter-switch latency, texture-upload duration
+- peak Java/native/GPU memory, ANR/crash count, thermal status over a sustained run
+- front/back camera, lighting condition, head pose and expression test case
+
+## Occlusion Roadmap
+
+1. **Face-surface depth occlusion:** render the live face mesh in a depth-only pass, then draw virtual effects using a consistent depth convention. This can hide virtual geometry behind the visible face surface where the tracked geometry represents it correctly.
+2. **Expression/texture regions:** validate eyes, eyelids, lips and mouth masks; a face depth mesh alone does not provide perfect interior-mouth/eye segmentation.
+3. **Hand/scene occlusion:** separate feature requiring hand or scene segmentation and/or usable depth information. A face mesh by itself cannot identify a hand crossing in front of the face.
+
+Occlusion correctness depends on model topology, mesh projection, z mapping, depth-buffer conventions, and the chosen camera composition path. It must be tested with explicit edge cases and golden images.
+
+## Research Notes: Snap-Inspired Ideas
+
+Public Snap research describes real-time monocular face tracking techniques including a learned region-based dynamic rigidity prior, separate rigid-pose and expression optimisation, facial landmarks, and dense optical flow. These are useful research references, not claims that Xelvic or MediaPipe implements Snap's private tracker.
+
+Recommended progression:
+
+1. Validate built-in MediaPipe landmarks, transformation matrices, blendshapes and temporal behaviour.
+2. Add pose decomposition and bounded smoothing/prediction with a validated timestamp contract.
+3. Measure pose jitter during smiles, mouth open, blinks and large head turns.
+4. If needed, investigate optical flow as additional motion evidence.
+5. Treat learned dynamic rigidity as an advanced research project: it may require a suitable model, training/validation data and a custom optimisation loop. It is not a ready-made checkbox in the MediaPipe task.
+
+**Expression-induced pose jitter and filter-switch jitter are different problems.** Dynamic rigidity targets ambiguity between non-rigid expression and rigid head motion. Fast filter switching instead requires persistent tracking, cached assets and effect replacement without resetting the tracker.
+
+## Replay, Golden Images, and Privacy
+
+### Replay harness
+
+Maintain a test-only harness that can replay a fixed set of consented/local frames and/or timestamped geometry results. Use the same input sequence to compare changes to coordinate mapping, smoothing, mesh rendering and texture mapping. Keep test datasets out of production assets and do not commit private camera footage to the repository.
+
+Golden-image tests should cover:
+
+- frontal face, left/right yaw, roll, near/far position
+- smile, mouth open, blink and eyebrow movement
+- front-camera mirroring and rear camera
+- crop/aspect ratio, device rotation and display sizes
+- face loss/re-entry and rapid filter switching
+- texture seams, eye/mouth masks, alpha and occlusion edges
+- high-resolution photo output and no-face capture behaviour
+
+### Privacy
+
+- Process camera frames, landmarks, blendshapes and face geometry locally by default.
+- Do not upload or persist raw frames/face geometry as telemetry.
+- If a user consents to share a debugging clip, treat it as test data, store it separately and remove it according to the test policy.
+- Production telemetry should be aggregate performance signals only, without raw images, landmarks or unique biometric profiles.
+
+## Development Phases and Acceptance Gates
+
+### R0 — Baseline and contracts
+
+- Confirm clean checkout/build/tests on the R&D branch.
+- Record the existing renderer and camera behaviour as baseline.
+- Pin the MediaPipe task/model version for the experiment.
+- Define `FaceGeometryProvider`, immutable snapshot contract, timestamp rules and topology/UV version.
+- Document every coordinate space and decide how the camera image reaches the GL scene.
+
+**Exit gate:** app builds, baseline is repeatable, and output coordinate spaces/topology are documented.
+
+### R1 — Live geometry visualization
+
+- Add MediaPipe behind a distinct R&D adapter or feature flag.
+- Confirm 3D landmarks, optional matrix and blendshape outputs.
+- Draw a mesh/wireframe with verified vertex ordering and projection.
+- Test the camera-to-preview/GL transform chain; don't start texture warping until the wireframe is correct.
+
+**Exit gate:** stable wireframe alignment on physical device for front/rear camera and representative rotations.
+
+### R2 — PNG texture on the 3D face mesh
+
+- Validate canonical mesh topology and UV coordinates against the chosen model.
+- Add GPU texture mapping and explicit mask/blend/alpha semantics.
+- Cache static mesh data and textures; update live vertices without rebuilding static topology.
+- Switch effects without restarting the camera/tracker; profile texture preload and upload hitches.
+
+**Exit gate:** texture remains attached across head motion/expression, no obvious UV topology mismatch, and resource usage is bounded.
+
+### R3 — Face depth occlusion
+
+- Add depth-only face pass with matching projection/depth convention.
+- Validate virtual objects/effect surfaces that pass behind face regions.
+- Add test coverage for nose, jaw and profile views.
+
+**Exit gate:** repeatable depth occlusion under supported poses; known limitations documented.
+
+### R4 — Photo parity, compatibility and device tuning
+
+- Re-detect the face in captured stills, with resolution/coordinate remapping.
+- Design offscreen rendering/GL context lifecycle or an explicit compatible CPU fallback.
+- Test legacy `.xfilter` v1 through Canvas and mesh-capable effects through the mesh renderer.
+- Profile low-end devices, cache limits, activity lifecycle and context loss.
+
+**Exit gate:** preview/photo behaviour is consistent with the documented effect definition; all tests pass and device measurements are reported.
+
+### Later — advanced tracking and video
+
+- Evaluate optical flow and learned dynamic rigidity only if tracking diagnostics justify them.
+- Investigate hand/scene occlusion separately from face occlusion.
+- Add video recording only after frame synchronisation, rendering and resource lifecycle are stable.
+
+## Build, Run, and Branch Workflow
+
+### Requirements
+
+- Android Studio compatible with the project's Android Gradle Plugin and Kotlin versions.
+- Android SDK/platform and build-tools required by the Gradle configuration.
+- Git for Windows.
+- A physical Android device is strongly recommended for camera, timing, GPU, thermal and lifecycle validation.
+
+### Clone the repository (Windows PowerShell)
+
+```powershell
+cd "$env:USERPROFILE\StudioProjects"
+git clone https://github.com/Ujj-CodeX/XelvicFilterbase.git
+cd XelvicFilterbase
 ```
 
+If the repository already exists locally, do not clone into the same folder again; enter the existing project directory instead.
+
+### Create/use the R&D branch
+
+```powershell
+git status
+git fetch origin
+git switch main
+git pull --ff-only origin main
+git switch -c research/face-mesh-texture-occlusion
+```
+
+If the branch already exists locally:
+
+```powershell
+git switch research/face-mesh-texture-occlusion
+git status
+```
+
+Do not discard uncommitted changes blindly. If `git pull --ff-only` fails, inspect the branch and remote status rather than forcing a reset.
+
+### Build and test
+
+From the repository root:
+
+```powershell
+.\gradlew.bat testDebugUnitTest
+.\gradlew.bat assembleDebug
+```
+
+Open the project in Android Studio, allow Gradle Sync to complete, then run on a connected physical device. Permission, signing, SDK and environment setup can differ after a Windows reinstallation; resolve setup errors separately from face-tracking/runtime crashes.
+
+### Change workflow
+
+1. Confirm branch and clean/understood working tree with `git status`.
+2. Make one scoped change set.
+3. Run affected tests, `testDebugUnitTest`, and `assembleDebug`.
+4. Test the applicable behaviour on a physical device before claiming runtime validation.
+5. Commit only intended source/tests/docs; do not commit local signing files, secrets, private `.env` values, generated APKs or personal camera footage.
+6. Push the R&D branch only when ready to preserve/share it; do not push unreviewed work to production `main`.
+
+Example commit:
+
+```powershell
+git add README.md app/src
+git commit -m "docs: define mesh engine R&D architecture"
+```
+
+Review `git status` and the staged diff before committing.
+
+## Physical-Device Verification Status
+
+No new performance or accuracy result is claimed by this document. Fill this table from actual runs rather than estimating values.
+
+| Metric | Target/criterion | Measured result | Status |
+|---|---|---|---|
+| Live wireframe alignment | Correct across supported poses and cameras | NOT MEASURED | Pending R1 |
+| Texture stability while smiling/blinking | No obvious region slip/seam in test set | NOT MEASURED | Pending R2 |
+| Filter-switch continuity | No tracker restart; bounded texture-switch hitch | NOT MEASURED | Pending R2 |
+| Face depth occlusion | Correct depth ordering for test effects | NOT MEASURED | Pending R3 |
+| Preview/photo geometry consistency | Same effect definition; separately detected still geometry | NOT MEASURED | Pending R4 |
+| Inference/render p50 and p95 | Report per physical device | NOT MEASURED | Pending profiling |
+| Peak memory and thermal behaviour | Within tested device budget | NOT MEASURED | Pending profiling |
+| GL context loss/resume | Resources recreated without crash | NOT MEASURED | Pending lifecycle tests |
+
+## References
+
+- MediaPipe Face Landmarker for Android: <https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker/android>
+- MediaPipe Face Landmarker overview: <https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker>
+- MediaPipe Face Geometry source/proto reference: <https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/modules/face_geometry/protos/face_geometry.proto>
+- ARCore canonical face mesh/UV asset authoring reference (related technology, not assumed to share the same topology): <https://developers.google.com/ar/develop/ios/augmented-faces/create-assets>
+- CameraX image analysis and image format/backpressure guidance: <https://developer.android.com/media/camera/camerax/analyze>
+- CameraX `ImageAnalysis.Builder` API: <https://developer.android.com/reference/androidx/camera/core/ImageAnalysis.Builder>
+- Snap Research, *Stabilized Real-time Face Tracking via a Learned Dynamic Rigidity Prior* (SIGGRAPH Asia 2018): <https://research.snap.com/publications/stabilized-real-time-face-tracking-via-a-learned-dynamic-rigidity-prior.html>
+
 ---
 
-## 7. Adaptive Performance Controller
-
-`AdaptivePerformanceController` prevents thermal throttling during extended camera sessions:
-- **`BALANCED`**: Evaluates every incoming frame (p95 inference latency $\le 45\text{ms}$).
-- **`PERFORMANCE`**: Evaluates every 2nd frame (p95 inference latency $> 45\text{ms}$).
-- **`LOW_LOAD`**: Evaluates every 3rd frame (p95 inference latency $> 65\text{ms}$, or when Android OS triggers Battery Saver mode).
-- **Hysteresis & Cooldown**: Downshifting occurs immediately under load; upgrading requires a **3-second stability cooldown** to prevent rapid profile oscillation.
-- **No-Face Power Save**: When no face is detected for $> 2.0\text{ seconds}$, frame processing automatically throttles to conserve CPU/GPU cycles.
-
----
-
-## 8. Memory & GC Hot-Path Optimization
-
-1. **Pre-allocated Draw Buffers**: Matrix transforms and `RectF` destination bounds are pre-allocated in `StickerRenderer` and reused per draw pass.
-2. **Safe Image Downsampling**: Filter assets (`.png`, `.webp`) are decoded using `BitmapFactory.Options` with bounds pre-computation (`inJustDecodeBounds = true`) and power-of-two `inSampleSize` downsampling (maximum dimension capped at 1280px) to prevent OutOfMemory errors on ultra-high-resolution custom filter imports.
-3. **Sensor Timestamps**: Uses CameraX `imageInfo.timestamp` instead of `System.currentTimeMillis()` for drift-free temporal analysis.
-
----
-
-## 9. Physical-Device Benchmark Procedure & Verification Table
-
-### Device Profiling Instructions
-
-1. **Android Studio Profiler**:
-   - Run the app on a connected physical device: **View > Tool Windows > Profiler**.
-   - Profile CPU, Memory, and Energy tracks during 60-second continuous face tracking.
-2. **Perfetto Trace Recording**:
-   ```bash
-   adb shell perfetto \
-     -c - --txt \
-     -o /data/misc/perfetto-traces/trace.perfetto-trace <<EOF
-   buffers: { size_kb: 65536 }
-   data_sources: {
-     config: {
-       name: "linux.ftrace"
-       ftrace_config: {
-         ftrace_events: "sched_switch"
-         ftrace_events: "power/cpu_frequency"
-       }
-     }
-   }
-   duration_ms: 15000
-   EOF
-   adb pull /data/misc/perfetto-traces/trace.perfetto-trace .
-   ```
-3. **On-Screen Telemetry HUD**:
-   - Double-tap the top camera bar or review `PerformanceMonitor` rolling metrics to observe live p50/p95 latency, tracking FPS, dropped frames, heap usage, and current profile.
-
-### Physical Device Benchmark Table
-
-*Note: Per strict engineering standards, emulator and container environments lack physical camera hardware and mobile thermal/battery governors; unmeasured physical hardware metrics are marked explicitly as `NOT MEASURED`.*
-
-| Metric | Target | Baseline (Before Optimization) | Hardened Architecture (Current) | Verification Status |
-| :--- | :---: | :---: | :---: | :---: |
-| **Compose Recompositions / sec** | 0 on tracking | ~30 - 35 recompositions/sec | 0 recompositions/sec | **VERIFIED (Code & Architecture)** |
-| **In-Flight Analysis Overlap** | 0 overlapping tasks | Frequent (Task queue backup) | 0 (AtomicBoolean single-flight lock) | **VERIFIED (Unit Test & Code)** |
-| **Angular Boundary Glitch (180°)** | Smooth $\le 5^\circ$ | 358° spin loop across boundary | Shortest-path $\Delta$ modular wrap | **VERIFIED (Unit Test)** |
-| **GC Allocations on Draw Path** | 0 bytes / frame | Continuous `RectF` / lambda allocations | 0 bytes / frame (Reused buffers) | **VERIFIED (Code & Architecture)** |
-| **Hysteresis Upgrade Cooldown** | 3.0s | None (profile flapping) | 3000ms strict cooldown | **VERIFIED (Unit Test)** |
-| **Preview Pacing / Jitter** | 60 fps stable | Noticeable under ML analysis load | Isolated display loop | *NOT MEASURED (Physical Device Required)* |
-| **ML Kit Inference Latency (p50)** | $< 30\text{ms}$ | Hardware-dependent | 480p downsampled input | *NOT MEASURED (Physical Device Required)* |
-| **ML Kit Inference Latency (p95)** | $< 45\text{ms}$ | Hardware-dependent | Adaptive frame skipping fallback | *NOT MEASURED (Physical Device Required)* |
-| **Battery Drain Rate (mAh/min)** | Low | High (Main thread saturation) | Reduced (Thread isolation + Low Load) | *NOT MEASURED (Physical Device Required)* |
-| **Device Surface Thermal Rise** | Minimal | Noticeable after 3 min continuous | Mitigated via 2s no-face sleep mode | *NOT MEASURED (Physical Device Required)* |
-
+**Project principle:** first prove geometry and coordinate correctness, then texture mapping, then occlusion, then advanced tracking and device tuning. Persistent tracking and static-resource reuse are requirements from the start; learned dynamic rigidity and other expensive research methods are introduced only when measurements justify them.
