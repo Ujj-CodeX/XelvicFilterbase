@@ -29,7 +29,7 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
         }
 
     @Volatile
-    var isEnabled: Boolean = false
+    var geometryDebugEnabled: Boolean = false
         set(value) {
             field = value
             if (!value) snapshotHolder?.clear()
@@ -56,7 +56,7 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (!isEnabled) return
+        if (!geometryDebugEnabled) return
 
         val snapshot = snapshotHolder?.getLatest()
         if (snapshot == null) {
@@ -122,7 +122,7 @@ fun FaceGeometryDebugOverlay(
         factory = { context ->
             FaceGeometryDebugOverlayView(context).apply {
                 snapshotHolder = holder
-                isEnabled = enabled
+                geometryDebugEnabled = enabled
             }
         },
         update = { view ->
