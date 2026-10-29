@@ -116,6 +116,7 @@ dependencies {
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   implementation(libs.mlkit.face.detection)
+  implementation(libs.mediapipe.tasks.vision)
 
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
