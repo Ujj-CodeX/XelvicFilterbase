@@ -683,17 +683,22 @@ class CameraController(
      * Releases listeners, CameraX use cases, executor and face detector.
      */
     fun release() {
+        if (released) return
+
         released = true
         geometryRequested = false
         _isMediaPipeGeometryEnabled.value = false
         _isMediaPipeFaceTracked.value = false
         faceGeometryHolder.onSnapshotUpdated = null
+
         val providerToClose = mediaPipeProvider
         mediaPipeProvider = null
-        try {
-            providerToClose?.close()
-            observedPreviewView?.let { view ->
 
+        try {
+            // Stop new frame delivery before disposing the live-stream task.
+            imageAnalysis?.clearAnalyzer()
+
+            observedPreviewView?.let { view ->
                 previewLayoutChangeListener?.let { listener ->
                     view.removeOnLayoutChangeListener(listener)
                 }
@@ -711,15 +716,29 @@ class CameraController(
             faceAnalyzer.updatePreviewOutputTransform(null)
 
             cameraProvider?.unbindAll()
+            imageAnalysis = null
+            preview = null
+            imageCapture = null
+            camera = null
 
             _isCameraReady.value = false
             currentPreviewView = null
 
+            // Serialize FaceLandmarker.close() after any frame-conversion work already queued
+            // on the CameraX analysis executor. shutdown() still drains queued tasks.
+            if (providerToClose != null) {
+                cameraExecutor.execute { providerToClose.close() }
+            }
             cameraExecutor.shutdown()
-            faceAnalyzer.release()
 
+            faceAnalyzer.release()
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing camera resources", e)
+            try {
+                providerToClose?.close()
+            } catch (closeError: Exception) {
+                Log.w(TAG, "Error closing MediaPipe provider during final cleanup", closeError)
+            }
         }
     }
 }
