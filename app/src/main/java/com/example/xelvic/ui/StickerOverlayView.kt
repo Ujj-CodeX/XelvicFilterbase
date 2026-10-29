@@ -34,6 +34,7 @@ class TrackingOverlayView(context: Context) : View(context) {
 
     var selectedFilter: InstalledFilter? = null
     var showDebugOverlay: Boolean = false
+    var isRenderingEnabled: Boolean = true
     var renderer: StickerRenderer? = null
     var performanceMonitor: PerformanceMonitor? = null
 
@@ -82,6 +83,7 @@ class TrackingOverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (!isRenderingEnabled) return
 
         val holder = poseHolder ?: return
         val currentRenderer = renderer ?: return
@@ -201,6 +203,7 @@ fun StickerOverlayView(
     selectedFilter: InstalledFilter?,
     showDebugOverlay: Boolean,
     renderer: StickerRenderer,
+    isRenderingEnabled: Boolean = true,
     performanceMonitor: PerformanceMonitor,
     modifier: Modifier = Modifier
 ) {
@@ -212,11 +215,13 @@ fun StickerOverlayView(
                 this.performanceMonitor = performanceMonitor
                 this.selectedFilter = selectedFilter
                 this.showDebugOverlay = showDebugOverlay
+                this.isRenderingEnabled = isRenderingEnabled
             }
         },
         update = { view ->
             view.selectedFilter = selectedFilter
             view.showDebugOverlay = showDebugOverlay
+            view.isRenderingEnabled = isRenderingEnabled
             view.invalidate()
         },
         modifier = modifier
