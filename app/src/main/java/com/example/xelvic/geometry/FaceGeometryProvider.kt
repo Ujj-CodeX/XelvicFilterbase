@@ -13,14 +13,17 @@ import androidx.camera.core.ImageProxy
  */
 interface FaceGeometryProvider : AutoCloseable {
 
-    fun setResultListener(listener: (FaceGeometrySnapshot?) -> Unit)
+    fun setResultListener(
+        listener: (FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit
+    )
 
     fun setErrorListener(listener: ((Throwable) -> Unit)?)
 
     fun submitFrame(
         imageProxy: ImageProxy,
         timestampMs: Long,
-        isMirrored: Boolean
+        isMirrored: Boolean,
+        displayTransform: FaceGeometryDisplayTransform?
     )
 
     override fun close()
