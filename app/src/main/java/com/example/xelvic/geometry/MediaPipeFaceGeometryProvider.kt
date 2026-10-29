@@ -214,7 +214,13 @@ class MediaPipeFaceGeometryProvider(
                     landmarks = landmarks,
                     blendshapes = blendshapes,
                     facialTransformationMatrix = matrix,
-                    topologyId = null
+                    topologyId = if (
+                        FaceMeshTessellation.supportsLandmarkCount(landmarks.size)
+                    ) {
+                        FaceMeshTessellation.TOPOLOGY_ID
+                    } else {
+                        null
+                    }
                 ),
                 frame.displayTransform
             )
