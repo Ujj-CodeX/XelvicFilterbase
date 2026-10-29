@@ -16,6 +16,7 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.security.MessageDigest
 
 /**
  * MediaPipe Face Landmarker implementation for the existing CameraX YUV_420_888 stream.
@@ -39,10 +40,13 @@ class MediaPipeFaceGeometryProvider(
     private val resultListener = AtomicReference<(FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit>({ _, _ -> })
     private val errorListener = AtomicReference<((Throwable) -> Unit)?>(null)
 
+    private val modelAssetSha256: String
+
     private val landmarker: FaceLandmarker
 
     init {
         requireModelAsset()
+        modelAssetSha256 = calculateModelAssetSha256()
 
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath(modelAssetPath)
@@ -218,7 +222,8 @@ class MediaPipeFaceGeometryProvider(
                         FaceMeshTessellation.TOPOLOGY_ID
                     } else {
                         null
-                    }
+                    },
+                    modelAssetSha256 = modelAssetSha256
                 ),
                 frame.displayTransform
             )
@@ -262,6 +267,25 @@ class MediaPipeFaceGeometryProvider(
             val previous = lastTimestampMs.get()
             val next = maxOf(candidate, previous + 1L)
             if (lastTimestampMs.compareAndSet(previous, next)) return next
+        }
+    }
+
+    /**
+     * Reads the model once, at provider initialisation, so UV assets can be tied to the exact
+     * task bundle rather than merely to a landmark count or a dependency version.
+     */
+    private fun calculateModelAssetSha256(): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        appContext.assets.open(modelAssetPath).use { input ->
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString(separator = "") { byte ->
+            (byte.toInt() and 0xff).toString(16).padStart(2, '0')
         }
     }
 
