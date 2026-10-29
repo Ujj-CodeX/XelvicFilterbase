@@ -72,7 +72,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import com.example.xelvic.camera.CameraController
 import com.example.xelvic.camera.FlashMode
-import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.model.FaceTrackingResult
 import com.example.xelvic.model.InstalledFilter
 import com.example.xelvic.renderer.StickerRenderer
