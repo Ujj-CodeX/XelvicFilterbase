@@ -30,7 +30,7 @@ The current repository version catalog/configuration lists the following baselin
 | Application ID | `com.aistudio.xelvic.krvpmz` |
 | Namespace | `com.example` |
 
-The baseline still uses ML Kit and is unchanged. The R&D branch pins `com.google.mediapipe:tasks-vision:1.1.1` and adds `MediaPipeFaceGeometryProvider`; the model asset itself is not committed. Place `face_landmarker.task` in `app/src/main/assets/` using the instructions in that directory. The adapter is isolated and not yet connected to `CameraController` or the renderer.
+The production baseline remains ML Kit and is unchanged. The R&D branch pins `com.google.mediapipe:tasks-vision:1.1.1` and includes an opt-in `CameraController` route to `MediaPipeFaceGeometryProvider` for diagnostics; normal startup still uses ML Kit. The model asset itself is not committed. Place `face_landmarker.task` in `app/src/main/assets/` using the instructions in that directory.
 
 ## Current Baseline vs. Mesh Engine R&D
 
@@ -537,7 +537,7 @@ Implemented on `research/face-mesh-texture-occlusion`:
 - Added unit tests for snapshot validation and immutability.
 - Added `app/src/main/assets/README.md` with the official model asset location.
 
-R1 implementation now includes an opt-in Face button and diagnostic point-cloud overlay. It swaps the single ImageAnalysis analyzer between MediaPipe and the existing ML Kit analyzer; the two trackers are not run simultaneously. Each submitted frame captures a CameraX `CoordinateTransform` from that ImageProxy to PreviewView, then carries the immutable 3×3 matrix with the asynchronous result so a later frame cannot accidentally supply its crop/mirror transform. If the exact transform is not available, the overlay falls back to the explicit `FILL_CENTER` approximation. If MediaPipe initialization or inference fails, the controller restores ML Kit and surfaces an error.
+R1 implementation now includes an opt-in Face button and diagnostic wireframe overlay. It swaps the single ImageAnalysis analyzer between MediaPipe and the existing ML Kit analyzer; the two trackers are not run simultaneously. Each submitted frame captures a CameraX `CoordinateTransform` from that ImageProxy to PreviewView, then carries the immutable 3×3 matrix with the asynchronous result so a later frame cannot accidentally supply its crop/mirror transform. If the exact transform is not available, the overlay falls back to the explicit `FILL_CENTER` approximation. If MediaPipe initialization or inference fails, the controller restores ML Kit and surfaces an error. The overlay draws the official Tasks API 468-point tessellation only when the snapshot's topology ID matches; it still shows all detected landmarks as points.
 
 Still pending / unverified:
 
@@ -545,4 +545,4 @@ Still pending / unverified:
 - Coordinate projection now prefers a per-frame CameraX `CoordinateTransform`; the `FILL_CENTER` + manual-mirror mapping is only a fallback. Exact alignment still needs physical-device validation with front/rear camera, rotation and ViewPort crop, especially under PreviewView's configured implementation mode.
 - The app has not been built/tested against these new commits in the user's Android Studio environment during this change.
 - Device-level image orientation, inference latency, visual coordinate correctness, thermal cost and memory use remain to be measured.
-- Triangle topology and UV coordinates are not supplied/verified by the snapshot adapter. The R1 overlay intentionally draws landmarks only; do not render a mesh texture until canonical topology and UVs are pinned and validated against the selected model.
+- The 468-point triangle connectivity is pinned from the official Tasks API source for the R1 wireframe. UV coordinates compatible with the pinned Face Landmarker model are still unresolved; do not use the legacy `canonical_face_model.obj` UVs blindly. MediaPipe has an issue noting that the legacy canonical OBJ can be incompatible with newer face-mesh vertex ordering: <https://github.com/google-ai-edge/mediapipe/issues/5760>. Do not render texture-mapped triangles until a model-compatible UV/topology asset is validated.
