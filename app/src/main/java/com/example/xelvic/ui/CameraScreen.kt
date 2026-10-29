@@ -1,6 +1,7 @@
 package com.example.xelvic.ui
 
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
@@ -38,6 +39,7 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.NotInterested
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -46,6 +48,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,6 +62,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -67,6 +72,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import com.example.xelvic.camera.CameraController
 import com.example.xelvic.camera.FlashMode
+import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.model.FaceTrackingResult
 import com.example.xelvic.model.InstalledFilter
 import com.example.xelvic.renderer.StickerRenderer
@@ -86,6 +92,19 @@ fun CameraScreen(
     onCapturePhoto: () -> Unit
 ) {
     var showDebugOverlay by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+    val isMediaPipeGeometryEnabled by cameraController.isMediaPipeGeometryEnabled.collectAsState()
+    val isMediaPipeFaceTracked by cameraController.isMediaPipeFaceTracked.collectAsState()
+    val geometryError by cameraController.geometryError.collectAsState()
+    val faceLockedForDisplay =
+        if (isMediaPipeGeometryEnabled) isMediaPipeFaceTracked else isFaceLocked
+
+    LaunchedEffect(geometryError) {
+        geometryError?.let { message ->
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
 
     val infiniteTransition = rememberInfiniteTransition(label = "face_indicator_pulse")
     val pulseAlpha by infiniteTransition.animateFloat(
@@ -117,6 +136,14 @@ fun CameraScreen(
             showDebugOverlay = showDebugOverlay,
             renderer = renderer,
             performanceMonitor = performanceMonitor,
+            isRenderingEnabled = !isMediaPipeGeometryEnabled,
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // R1: MediaPipe point cloud only. No triangle topology is assumed in this phase.
+        FaceGeometryDebugOverlay(
+            holder = cameraController.faceGeometryHolder,
+            enabled = isMediaPipeGeometryEnabled,
             modifier = Modifier.fillMaxSize()
         )
 
@@ -190,6 +217,23 @@ fun CameraScreen(
                         )
                     }
 
+                    // Isolated R&D face-geometry path (replaces ML Kit for analysis while enabled).
+                    IconButton(
+                        onClick = {
+                            cameraController.setMediaPipeGeometryEnabled(
+                                !isMediaPipeGeometryEnabled
+                            )
+                        },
+                        modifier = Modifier.size(40.dp).testTag("mediapipe_geometry_toggle_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Face,
+                            contentDescription = "Toggle MediaPipe geometry diagnostics",
+                            tint = if (isMediaPipeGeometryEnabled) Color(0xFF00E5FF) else Color(0xFF94A3B8),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
                     // Camera Switch (Front / Rear)
                     IconButton(
                         onClick = { cameraController.toggleCamera() },
@@ -209,11 +253,11 @@ fun CameraScreen(
 
             // Face Tracking Status Indicator
             Surface(
-                color = if (isFaceLocked) Color(0xAA064E3B) else Color(0x881E293B),
+                color = if (faceLockedForDisplay) Color(0xAA064E3B) else Color(0x881E293B),
                 shape = RoundedCornerShape(16.dp),
                 border = androidx.compose.foundation.BorderStroke(
                     1.dp,
-                    if (isFaceLocked) Color(0xFF10B981) else Color(0xFF475569)
+                    if (faceLockedForDisplay) Color(0xFF10B981) else Color(0xFF475569)
                 )
             ) {
                 Row(
@@ -224,12 +268,12 @@ fun CameraScreen(
                         modifier = Modifier
                             .size(7.dp)
                             .clip(CircleShape)
-                            .background(if (isFaceLocked) Color(0xFF34D399) else Color(0xFF94A3B8))
-                            .alpha(if (isFaceLocked) 1f else pulseAlpha)
+                            .background(if (faceLockedForDisplay) Color(0xFF34D399) else Color(0xFF94A3B8))
+                            .alpha(if (faceLockedForDisplay) 1f else pulseAlpha)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (isFaceLocked) "Face Locked" else "Searching Face…",
+                        text = when {\n                            isMediaPipeGeometryEnabled && isMediaPipeFaceTracked -> "MediaPipe Face Locked"\n                            isMediaPipeGeometryEnabled -> "MediaPipe: Searching…"\n                            isFaceLocked -> "Face Locked"\n                            else -> "Searching Face…"\n                        },
                         color = if (isFaceLocked) Color(0xFFD1FAE5) else Color(0xFFCBD5E1),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Medium
