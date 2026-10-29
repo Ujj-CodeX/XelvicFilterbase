@@ -447,8 +447,7 @@ class CameraController(
                     }
                     candidate.setErrorListener { error ->
                         if (geometryRequested && !released) {
-                            _geometryError.value =
-                                error.message ?: "MediaPipe geometry inference failed"
+                            fallbackToMlKitOnGeometryError(error)
                         }
                     }
 
@@ -490,6 +489,31 @@ class CameraController(
         } else {
             faceAnalyzer
         }
+
+    /**
+     * On task/inference failure, restore the established ML Kit analysis path rather than
+     * leaving the camera without a working tracker.
+     */
+    private fun fallbackToMlKitOnGeometryError(error: Throwable) {
+        if (!geometryRequested || released) return
+
+        geometryRequested = false
+        _isMediaPipeGeometryEnabled.value = false
+        _isMediaPipeFaceTracked.value = false
+        faceGeometryHolder.clear()
+        _geometryError.value =
+            "MediaPipe failed; returned to ML Kit: ${error.message ?: error.javaClass.simpleName}"
+
+        val providerToClose = mediaPipeProvider
+        mediaPipeProvider = null
+        imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
+
+        try {
+            cameraExecutor.execute { providerToClose?.close() }
+        } catch (_: Exception) {
+            providerToClose?.close()
+        }
+    }
 
     /**
      * Toggles between front and rear cameras.
