@@ -547,3 +547,18 @@ Still pending / unverified:
 - The app has not been built/tested against these new commits in the user's Android Studio environment during this change.
 - Device-level image orientation, inference latency, visual coordinate correctness, thermal cost and memory use remain to be measured.
 - The 468-point triangle connectivity is pinned from the official Tasks API source for the R1 wireframe. UV coordinates compatible with the pinned Face Landmarker model are still unresolved; do not use the legacy `canonical_face_model.obj` UVs blindly. MediaPipe has an issue noting that the legacy canonical OBJ can be incompatible with newer face-mesh vertex ordering: <https://github.com/google-ai-edge/mediapipe/issues/5760>. Do not render texture-mapped triangles until a model-compatible UV/topology asset is validated.
+
+
+## Mesh Renderer Gate Hardening — Current Research Status
+
+The R&D branch now makes model/UV compatibility an explicit, testable contract before a face-mesh texture backend can be selected.
+
+- `MediaPipeFaceGeometryProvider` calculates the SHA-256 fingerprint of the exact local `face_landmarker.task` asset once at initialisation and attaches it to each immutable `FaceGeometrySnapshot`.
+- `FaceMeshUvMap` accepts a UV table only when its topology identifier matches the pinned Tasks API tessellation, the UV table has exactly 468 entries, the active task-bundle fingerprint matches, and the UV asset fingerprint matches an independently pinned expected digest.
+- `RenderBackendRouter` keeps legacy schema-v1 2D filters on Canvas. It selects the GL mesh backend only when a validated UV map and compatible device capabilities are supplied. Missing UVs, model/topology mismatches, unknown texture limits, unsupported GL, oversized textures or a missing required depth buffer fail closed instead of silently treating a face texture as a flat sticker.
+- `FaceMeshUvMapTest` and `RenderBackendRouterTest` cover successful validation and mismatch/capability rejection paths.
+- `.github/workflows/android-ci.yml` adds a GitHub Actions unit-test job for the research branch and pull requests into `main`.
+
+**This is validation infrastructure, not a completed GPU renderer.** No compatible UV table or UV asset is bundled, no mesh texture is yet drawn in the preview, and no depth pre-pass has been implemented. The new router is not yet wired into filter-package manifests or `CameraScreen` because the schema/API that advertises and installs a mesh effect still needs a separately reviewed, backward-compatible extension. Until that and the physical-device coordinate checks pass, use the existing Canvas implementation for shipped filters.
+
+The current implementation environment did not run Android Gradle tests or a physical-device session. The CI workflow is intended to provide automated unit-test evidence when GitHub Actions executes; until its run is observed as passing, this branch must not be described as build-verified.
