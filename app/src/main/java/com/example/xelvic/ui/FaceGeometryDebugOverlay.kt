@@ -127,7 +127,7 @@ fun FaceGeometryDebugOverlay(
         },
         update = { view ->
             view.snapshotHolder = holder
-            view.isEnabled = enabled
+            view.geometryDebugEnabled = enabled
         },
         modifier = modifier.testTag("face_geometry_debug_overlay")
     )
