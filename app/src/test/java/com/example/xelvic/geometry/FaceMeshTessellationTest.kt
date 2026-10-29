@@ -20,7 +20,9 @@ class FaceMeshTessellationTest {
     fun topologySupportsTheFaceSurfaceAndOptionalIrisLandmarks() {
         assertFalse(FaceMeshTessellation.supportsLandmarkCount(467))
         assertTrue(FaceMeshTessellation.supportsLandmarkCount(468))
+        assertFalse(FaceMeshTessellation.supportsLandmarkCount(469))
         assertTrue(FaceMeshTessellation.supportsLandmarkCount(478))
+        assertFalse(FaceMeshTessellation.supportsLandmarkCount(479))
     }
 
     @Test
