@@ -23,13 +23,35 @@ object FaceGeometryProjection {
         viewHeight: Int,
         mirrorHorizontally: Boolean
     ): Point? {
+        val output = FloatArray(2)
+        if (!projectFillCenterInto(
+                vertex, imageWidth, imageHeight, viewWidth, viewHeight,
+                mirrorHorizontally, output
+            )
+        ) return null
+        return Point(output[0], output[1])
+    }
+
+    /**
+     * Writes projected coordinates into a caller-owned FloatArray to avoid per-landmark
+     * object allocation on the render path.
+     */
+    fun projectFillCenterInto(
+        vertex: FaceVertex,
+        imageWidth: Int,
+        imageHeight: Int,
+        viewWidth: Int,
+        viewHeight: Int,
+        mirrorHorizontally: Boolean,
+        output: FloatArray,
+        offset: Int = 0
+    ): Boolean {
+        require(offset >= 0 && offset + 1 < output.size)
         if (
             imageWidth <= 0 || imageHeight <= 0 ||
             viewWidth <= 0 || viewHeight <= 0 ||
             !vertex.x.isFinite() || !vertex.y.isFinite()
-        ) {
-            return null
-        }
+        ) return false
 
         val scale = max(
             viewWidth.toFloat() / imageWidth,
@@ -43,7 +65,10 @@ object FaceGeometryProjection {
         val xInView = vertex.x * imageWidth * scale + left
         val yInView = vertex.y * imageHeight * scale + top
         val displayX = if (mirrorHorizontally) viewWidth - xInView else xInView
+        if (!displayX.isFinite() || !yInView.isFinite()) return false
 
-        return Point(displayX, yInView)
+        output[offset] = displayX
+        output[offset + 1] = yInView
+        return true
     }
 }
