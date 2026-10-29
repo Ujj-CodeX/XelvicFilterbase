@@ -18,6 +18,7 @@ import java.nio.ShortBuffer
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 
 /**
  * Immutable render input. The caller retains Bitmap ownership and must keep it alive and
@@ -50,6 +51,36 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
 ) : GLSurfaceView(context, attrs) {
 
     private val meshRenderer = FaceMeshGlRenderer()
+
+    @Volatile
+    private var attachedHolder: FaceGeometrySnapshotHolder? = null
+
+    @Volatile
+    private var snapshotListenerHandle: AutoCloseable? = null
+
+    fun setSnapshotHolder(next: FaceGeometrySnapshotHolder?) {
+        if (attachedHolder === next) {
+            publishFrame(next?.getLatest())
+            return
+        }
+
+        snapshotListenerHandle?.close()
+        snapshotListenerHandle = null
+        attachedHolder = next
+
+        publishFrame(next?.getLatest())
+
+        if (next != null) {
+            snapshotListenerHandle = next.addSnapshotListener {
+                publishFrame(next.getLatest())
+            }
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        setSnapshotHolder(null)
+        super.onDetachedFromWindow()
+    }
 
     init {
         setEGLContextClientVersion(2)

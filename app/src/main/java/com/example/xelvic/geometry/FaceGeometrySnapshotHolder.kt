@@ -62,9 +62,16 @@ data class FaceGeometryRenderFrame(
 class FaceGeometrySnapshotHolder {
 
     private val latest = AtomicReference<FaceGeometryRenderFrame?>(null)
+    private val snapshotListeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
 
     @Volatile
     var onSnapshotUpdated: (() -> Unit)? = null
+
+    /** Adds an independent observer without replacing the legacy Canvas invalidation callback. */
+    fun addSnapshotListener(listener: () -> Unit): AutoCloseable {
+        snapshotListeners.add(listener)
+        return AutoCloseable { snapshotListeners.remove(listener) }
+    }
 
     fun publish(
         snapshot: FaceGeometrySnapshot?,
@@ -72,6 +79,13 @@ class FaceGeometrySnapshotHolder {
     ) {
         latest.set(snapshot?.let { FaceGeometryRenderFrame(it, displayTransform) })
         onSnapshotUpdated?.invoke()
+        snapshotListeners.forEach { listener ->
+            try {
+                listener()
+            } catch (_: Exception) {
+                // One UI/GL subscriber must not prevent other subscribers from receiving the frame.
+            }
+        }
     }
 
     fun getLatest(): FaceGeometryRenderFrame? = latest.get()

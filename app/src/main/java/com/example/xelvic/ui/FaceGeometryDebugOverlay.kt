@@ -38,7 +38,7 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
         set(value) {
             if (field == value) return
             field = value
-            if (!value) snapshotHolder?.clear()
+            // Overlay visibility must not clear controller-owned geometry shared with other renderers.
             invalidate()
         }
 
@@ -203,12 +203,12 @@ fun FaceGeometryDebugOverlay(
     AndroidView(
         factory = { context ->
             FaceGeometryDebugOverlayView(context).apply {
-                snapshotHolder = holder
+                snapshotHolder = if (enabled) holder else null
                 geometryDebugEnabled = enabled
             }
         },
         update = { view ->
-            view.snapshotHolder = holder
+            view.snapshotHolder = if (enabled) holder else null
             view.geometryDebugEnabled = enabled
         },
         modifier = modifier.testTag("face_geometry_debug_overlay")

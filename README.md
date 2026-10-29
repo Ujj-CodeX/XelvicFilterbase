@@ -584,3 +584,17 @@ The current implementation environment did not run Android Gradle tests or a phy
 R3 introduces an opt-in `FaceMeshGlOverlayView` and `FaceMeshGlFrameBuilder` as a standalone GLES 2.0 proof-of-concept. The view uses a transparent `GLSurfaceView` overlay (Path A), uploads a supplied Bitmap on the GL thread, reuses the static 852-triangle Tasks API tessellation, and updates only per-frame vertex/UV buffers. The frame builder requires the exact CameraX image-to-preview transform attached to that inference result, a validated `FaceMeshUvMap`, matching model SHA-256, topology ID, and UV-layout ID. Stale frames older than 250 ms are not drawn.
 
 **Integration status:** this renderer is not attached to `CameraScreen` and is not yet fed by the `.xfilter` selection path. No production UV layout is registered, so real package effects remain blocked until a model-compatible UV asset is independently verified and pinned. The current renderer does not implement depth pre-pass, self-occlusion, still-photo rendering, or a device-validated performance budget. GL texture upload/deletion remains GL-thread-only; callers must keep the supplied Bitmap alive and unchanged while selected. Test `FaceMeshGlFrameBuilderTest` covers transform requirements, model/topology/layout mismatch, UV-origin conversion, dimensions, and buffer sizing.
+
+## GLES2 Wireframe Camera Integration — R4 Diagnostic Spike
+
+R4 adds an opt-in transparent GLES2 wireframe diagnostic to the CameraScreen. It consumes the
+latest immutable MediaPipe frame and its exact per-frame CameraX transform through a separate
+snapshot subscription; it does not replace the existing ML Kit production path. The GL view draws
+only the pinned 468-vertex face surface's edges, rejects stale frames and missing/mismatched model
+or topology identity, and never uses a guessed projection fallback. Use the Grid icon only after
+enabling MediaPipe geometry diagnostics to compare GL alignment against the Canvas overlay.
+
+**Not a production texture feature:** no UV layout is created or registered by R4. GPU texture
+rendering, face-depth occlusion, still-photo parity and physical-device alignment/performance remain
+separate validation gates. This patch is local-only until the developer explicitly commits it.
+
