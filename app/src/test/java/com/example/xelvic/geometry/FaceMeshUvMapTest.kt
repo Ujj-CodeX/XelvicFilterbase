@@ -93,7 +93,7 @@ class FaceMeshUvMapTest {
         val original = first[0]
         first[0] = 0.99f
 
-        assertEquals(original, map.coordinates.first().u)
+        assertEquals(original, map.coordinates.first().u, 0f)
         assertNotNull(map.coordinates)
     }
 
