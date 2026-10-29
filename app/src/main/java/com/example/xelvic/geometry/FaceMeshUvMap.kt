@@ -30,6 +30,7 @@ class FaceMeshUvMap private constructor(
     val modelAssetSha256: String,
     val uvAssetSha256: String,
     val uvOrigin: UvOrigin,
+    val uvLayoutId: String?,
     coordinates: List<FaceUvCoordinate>
 ) {
     val coordinates: List<FaceUvCoordinate> =
@@ -62,12 +63,17 @@ class FaceMeshUvMap private constructor(
             sourceUvAssetSha256: String,
             expectedUvAssetSha256: String,
             coordinates: List<FaceUvCoordinate>,
-            uvOrigin: UvOrigin
+            uvOrigin: UvOrigin,
+            uvLayoutId: String? = null
         ): FaceMeshUvMapValidation {
             if (expectedTopologyId != FaceMeshTessellation.TOPOLOGY_ID ||
                 sourceTopologyId != expectedTopologyId
             ) {
                 return FaceMeshUvMapValidation(null, FaceMeshUvMapFailure.TOPOLOGY_MISMATCH)
+            }
+
+            if (uvLayoutId != null && !uvLayoutId.matches(Regex("^[A-Za-z0-9_.:-]{1,128}$"))) {
+                return FaceMeshUvMapValidation(null, FaceMeshUvMapFailure.INVALID_LAYOUT_ID)
             }
 
             if (!isSha256(sourceModelAssetSha256) ||
@@ -100,6 +106,7 @@ class FaceMeshUvMap private constructor(
                     modelAssetSha256 = sourceModelAssetSha256,
                     uvAssetSha256 = sourceUvAssetSha256,
                     uvOrigin = uvOrigin,
+                    uvLayoutId = uvLayoutId,
                     coordinates = coordinates
                 ),
                 null
@@ -117,7 +124,8 @@ enum class FaceMeshUvMapFailure {
     ACTIVE_MODEL_IDENTITY_MISSING,
     MODEL_MISMATCH,
     UV_ASSET_FINGERPRINT_MISMATCH,
-    INVALID_VERTEX_COUNT
+    INVALID_VERTEX_COUNT,
+    INVALID_LAYOUT_ID
 }
 
 data class FaceMeshUvMapValidation(

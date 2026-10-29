@@ -89,6 +89,36 @@ class FilterPackageManagerHardeningTest {
     }
 
     @Test
+    fun rejectsSchemaV2MeshInstallUntilRendererIsReadyAndPreservesExistingFilter() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = prepareManager(context)
+        val originalManifest = installedCatManifest(manager)
+        val entries = readBundledPackage(context, "cat_face.xfilter")
+        val manifest = JSONObject(entries.getValue("manifest.json").toString(Charsets.UTF_8))
+
+        manifest.put("schemaVersion", 2)
+        manifest.put("minimumRuntimeVersion", 2)
+        manifest.put("renderer", "FACE_MESH_TEXTURE")
+        manifest.remove("layers")
+        manifest.put(
+            "meshTexture",
+            JSONObject()
+                .put("asset", "assets/cat_nose.png")
+                .put("uvLayout", "uv-layout-pending")
+                .put("blendMode", "NORMAL")
+                .put("opacity", 1.0)
+        )
+        entries["manifest.json"] = manifest.toString().toByteArray(Charsets.UTF_8)
+
+        val failure = assertThrows(FilterPackageException::class.java) {
+            manager.installPackage(ByteArrayInputStream(buildArchive(entries)))
+        }
+
+        assertTrue(failure.message.orEmpty().contains("not installable yet"))
+        assertEquals(originalManifest, installedCatManifest(manager))
+    }
+
+    @Test
     fun invalidReplacementPreservesExistingFilter() {
         val context =
             ApplicationProvider.getApplicationContext<Context>()

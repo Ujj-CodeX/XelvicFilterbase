@@ -19,6 +19,7 @@ enum class RenderBackendBlockReason {
     NONE,
     MESH_REQUIREMENTS_MISSING,
     UV_MAP_NOT_VALIDATED,
+    UV_LAYOUT_MISMATCH,
     ACTIVE_MODEL_IDENTITY_MISSING,
     MODEL_MISMATCH,
     TOPOLOGY_MISMATCH,
@@ -37,6 +38,7 @@ data class RenderBackendCapabilities(
 
 data class FaceMeshTextureRequirements(
     val topologyId: String,
+    val uvLayoutId: String?,
     val activeModelAssetSha256: String?,
     val uvMap: FaceMeshUvMap?,
     val textureWidth: Int,
@@ -70,6 +72,12 @@ object RenderBackendRouter {
 
         val uvMap = mesh.uvMap
             ?: return blocked(RenderBackendBlockReason.UV_MAP_NOT_VALIDATED)
+
+        val requiredUvLayoutId = mesh.uvLayoutId?.takeIf { it.isNotBlank() }
+            ?: return blocked(RenderBackendBlockReason.UV_LAYOUT_MISMATCH)
+        if (uvMap.uvLayoutId != requiredUvLayoutId) {
+            return blocked(RenderBackendBlockReason.UV_LAYOUT_MISMATCH)
+        }
 
         if (mesh.activeModelAssetSha256 == null) {
             return blocked(RenderBackendBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)

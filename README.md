@@ -228,9 +228,9 @@ The current schema describes 2D layers with fields such as:
 
 Existing schema v1 packages should remain readable and continue to render through the Canvas compatibility renderer unless they explicitly meet the newer mesh-effect contract.
 
-### Proposed schema v2 extension (design only)
+### Schema v2 extension (R2 preparation; GL renderer still blocked)
 
-The following is a concept, not accepted syntax in the current parser or package validator. Final field names and validation rules must be implemented and tested before authoring v2 packages.
+The R2-prep slice now parses and validates this schema-v2 metadata shape. It does not assert that a declared UV layout is compatible with the active model. The package installer deliberately blocks mesh packages until the pinned UV registry and live GL renderer are connected and validated.
 
 ```json
 {
@@ -238,6 +238,7 @@ The following is a concept, not accepted syntax in the current parser or package
   "id": "sample_face_paint",
   "name": "Sample Face Paint",
   "version": "1.0.0",
+  "thumbnail": "thumbnail.png",
   "minimumRuntimeVersion": 2,
   "renderer": "FACE_MESH_TEXTURE",
   "meshTexture": {
@@ -265,6 +266,12 @@ The future package-to-render flow should be:
 ```
 
 Keep ZIP Slip/path traversal prevention, strict archive/extraction limits, allow-listed asset types, and transactional installation. If adding texture/image types or higher texture sizes, update the security limits/tests deliberately; do not weaken validation as a side effect of supporting meshes.
+
+### Schema-v2 implementation status (R2 preparation)
+
+The parser and package validator now define an additive `schemaVersion: 2` contract for `FACE_MESH_TEXTURE`, including the texture asset, a UV-layout identifier, `NORMAL` blend mode, bounded opacity, and optional region mask. The existing schema-v1 layer manifest still defaults to Canvas. Schema-v2 image assets are checked with the same canonical-path, image-signature, dimension and pixel-budget rules as legacy assets.
+
+**Mesh packages are deliberately not installable yet.** The installation path fails closed after validation until a model-compatible UV registry and the actual GL renderer are connected to the live camera path. `uvLayout` is metadata only; the placeholder identifier in tests is not a validated UV asset, and no face texture rendering or occlusion is claimed by this task.
 
 ## Preview vs. Still Photo
 
@@ -550,6 +557,15 @@ Still pending / unverified:
 
 
 ## Mesh Renderer Gate Hardening — Current Research Status
+
+### UV asset loading contract (next R2 gate)
+
+- `FaceMeshUvAssetParser` parses an app-owned UV JSON asset and computes its SHA-256 from the exact file bytes. The expected digest is supplied by `PinnedFaceMeshUvLayout`, an app-controlled allow-list entry, not by the `.xfilter` package.
+- Every asset identifies the UV layout, the exact Face Landmarker task bundle SHA-256, topology ID, UV origin and exactly 468 finite normalized coordinates. Model, topology, vertex-count, digest, layout-ID and coordinate failures return explicit blocked results.
+- `FaceMeshUvRegistry` loads only allow-listed app asset paths. Arbitrary filter package paths cannot register a UV layout. No production UV layout is registered by this slice because a model-compatible layout has not yet been verified.
+- The renderer router now requires the effect's `uvLayout` to equal the validated map's `uvLayoutId`. A missing/unregistered layout remains unavailable; no shader draw, texture mapping or occlusion is claimed.
+
+The legacy `canonical_face_model.obj` is not accepted on landmark count alone. MediaPipe's issue #5760 describes incompatibility between the legacy canonical OBJ and newer Face Landmarker ordering, and the maintainer response notes that the legacy geometry assets are no longer updated for the newer Task API: https://github.com/google-ai-edge/mediapipe/issues/5760. Use only a source whose point ordering/topology is verified against the pinned task bundle, then pin its exact SHA-256.
 
 The R&D branch now makes model/UV compatibility an explicit, testable contract before a face-mesh texture backend can be selected.
 

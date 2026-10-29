@@ -74,25 +74,73 @@ class FilterPackageManager(private val context: Context) {
         val id = root.optString("id", "")
         val name = root.optString("name", "")
         val version = root.optString("version", "")
-        val layers = root.optJSONArray("layers")
-            ?: throw FilterPackageException("Manifest must contain a layers array")
 
-        if (schemaVersion < 1 || runtimeVersion < 1) {
-            throw FilterPackageException("Invalid schema/runtime version")
+        if (schemaVersion !in 1..FilterDefinition.CURRENT_SUPPORTED_SCHEMA) {
+            throw FilterPackageException("Unsupported schema version: $schemaVersion")
+        }
+        if (runtimeVersion !in 1..FilterDefinition.CURRENT_RUNTIME_VERSION) {
+            throw FilterPackageException("Unsupported minimum runtime version: $runtimeVersion")
+        }
+        if (schemaVersion == 2 && runtimeVersion < 2) {
+            throw FilterPackageException("Schema v2 requires minimumRuntimeVersion 2")
         }
 
         if (!id.matches(Regex("^[A-Za-z0-9_-]{1,64}$"))) {
             throw FilterPackageException("Invalid package ID")
         }
-
         if (name.isBlank() || name.length > 100) {
             throw FilterPackageException("Invalid package name")
         }
-
         if (version.isBlank() || version.length > 50) {
             throw FilterPackageException("Invalid package version")
         }
 
+        if (schemaVersion == 2) {
+            if (root.has("layers")) {
+                val v2Layers = root.optJSONArray("layers")
+                if (v2Layers == null || v2Layers.length() != 0) {
+                    throw FilterPackageException(
+                        "Schema v2 mesh filters must not contain legacy layers"
+                    )
+                }
+            }
+            if (root.optString("renderer", "") != "FACE_MESH_TEXTURE") {
+                throw FilterPackageException(
+                    "Schema v2 renderer must be FACE_MESH_TEXTURE"
+                )
+            }
+
+            val mesh = root.optJSONObject("meshTexture")
+                ?: throw FilterPackageException("Schema v2 requires a meshTexture object")
+            if (mesh.optString("asset", "").isBlank()) {
+                throw FilterPackageException("meshTexture.asset is required")
+            }
+            val uvLayout = mesh.optString("uvLayout", "")
+            if (!uvLayout.matches(Regex("^[A-Za-z0-9_.:-]{1,128}$"))) {
+                throw FilterPackageException("Invalid meshTexture.uvLayout")
+            }
+            if (mesh.optString("blendMode", "") != "NORMAL") {
+                throw FilterPackageException(
+                    "Unsupported meshTexture.blendMode; only NORMAL is supported"
+                )
+            }
+            val meshOpacity = readFiniteNumber(mesh, "opacity")
+            if (meshOpacity !in 0.0..1.0) {
+                throw FilterPackageException("meshTexture.opacity must be within [0, 1]")
+            }
+            if (mesh.has("regionMask") && !mesh.isNull("regionMask") &&
+                mesh.optString("regionMask", "").isBlank()
+            ) {
+                throw FilterPackageException("meshTexture.regionMask cannot be blank")
+            }
+            return
+        }
+
+        if (root.has("renderer") || root.has("meshTexture")) {
+            throw FilterPackageException("Schema v1 cannot declare mesh rendering fields")
+        }
+        val layers = root.optJSONArray("layers")
+            ?: throw FilterPackageException("Schema v1 manifest must contain a layers array")
         if (layers.length() !in 1..MAX_LAYERS) {
             throw FilterPackageException(
                 "Package must contain between 1 and $MAX_LAYERS layers"
@@ -104,21 +152,13 @@ class FilterPackageManager(private val context: Context) {
             "LEFT_EYE", "RIGHT_EYE", "NOSE", "MOUTH",
             "LEFT_CHEEK", "RIGHT_CHEEK"
         )
-
-        val allowedScaleModes = setOf(
-            "FACE_WIDTH", "FACE_HEIGHT", "EYE_DISTANCE"
-        )
-
-        val allowedRotationModes = setOf(
-            "FACE_ROLL", "EYE_LINE", "FIXED"
-        )
-
+        val allowedScaleModes = setOf("FACE_WIDTH", "FACE_HEIGHT", "EYE_DISTANCE")
+        val allowedRotationModes = setOf("FACE_ROLL", "EYE_LINE", "FIXED")
         val layerIds = mutableSetOf<String>()
 
         for (index in 0 until layers.length()) {
             val layer = layers.optJSONObject(index)
                 ?: throw FilterPackageException("Layer $index is not an object")
-
             val layerId = layer.optString("id", "")
             val asset = layer.optString("asset", "")
             val anchor = layer.optString("anchor", "").uppercase(Locale.ROOT)
@@ -128,23 +168,18 @@ class FilterPackageManager(private val context: Context) {
             if (!layerId.matches(Regex("^[A-Za-z0-9_-]{1,64}$"))) {
                 throw FilterPackageException("Invalid ID in layer $index")
             }
-
             if (!layerIds.add(layerId)) {
                 throw FilterPackageException("Duplicate layer ID: $layerId")
             }
-
             if (asset.isBlank()) {
                 throw FilterPackageException("Layer $layerId has no asset path")
             }
-
             if (anchor !in allowedAnchors) {
                 throw FilterPackageException("Unsupported anchor in layer $layerId")
             }
-
             if (scaleMode !in allowedScaleModes) {
                 throw FilterPackageException("Unsupported scale mode in layer $layerId")
             }
-
             if (rotationMode !in allowedRotationModes) {
                 throw FilterPackageException("Unsupported rotation mode in layer $layerId")
             }
@@ -154,34 +189,28 @@ class FilterPackageManager(private val context: Context) {
             val offsetY = readFiniteNumber(layer, "offsetY")
             val rotation = readFiniteNumber(layer, "rotationDegrees")
             val opacity = readFiniteNumber(layer, "opacity")
-
             if (scale <= 0.0 || scale > 10.0) {
                 throw FilterPackageException("Invalid scale in layer $layerId")
             }
-
             if (offsetX !in -5.0..5.0 || offsetY !in -5.0..5.0) {
                 throw FilterPackageException("Offsets out of range in layer $layerId")
             }
-
             if (rotation !in -3600.0..3600.0) {
                 throw FilterPackageException("Rotation out of range in layer $layerId")
             }
-
             if (opacity !in 0.0..1.0) {
                 throw FilterPackageException("Opacity out of range in layer $layerId")
             }
-
             if (!layer.has("zIndex") || layer.isNull("zIndex")) {
                 throw FilterPackageException("Layer $layerId is missing zIndex")
             }
-
             val zIndex = layer.optInt("zIndex", Int.MIN_VALUE)
-
             if (zIndex !in -1000..1000) {
                 throw FilterPackageException("Invalid zIndex in layer $layerId")
             }
         }
     }
+
 
     private fun readFiniteNumber(
         json: JSONObject,
@@ -214,7 +243,6 @@ class FilterPackageManager(private val context: Context) {
             definition.thumbnail,
             setOf("png", "webp")
         )
-
         validateImageBounds(thumbnail, "thumbnail")
 
         for (layer in definition.layers) {
@@ -223,10 +251,28 @@ class FilterPackageManager(private val context: Context) {
                 layer.asset,
                 setOf("png", "webp")
             )
-
             validateImageBounds(asset, "layer ${layer.id}")
         }
+
+        definition.meshTexture?.let { mesh ->
+            val texture = resolvePackageFile(
+                packageRoot,
+                mesh.asset,
+                setOf("png", "webp")
+            )
+            validateImageBounds(texture, "mesh texture")
+
+            mesh.regionMask?.let { relativePath ->
+                val mask = resolvePackageFile(
+                    packageRoot,
+                    relativePath,
+                    setOf("png", "webp")
+                )
+                validateImageBounds(mask, "mesh region mask")
+            }
+        }
     }
+
 
     private fun resolvePackageFile(
         packageRoot: File,
@@ -512,6 +558,13 @@ class FilterPackageManager(private val context: Context) {
 
             // 4. Validate every referenced file before replacing anything.
             validatePackageAssets(tempDir, definition)
+
+            // Fail closed: this app build has no model-pinned UV registry or live GL mesh renderer.
+            if (definition.renderer == com.example.xelvic.model.FilterRenderer.FACE_MESH_TEXTURE) {
+                throw FilterPackageException(
+                    "FACE_MESH_TEXTURE packages are not installable yet; the UV registry and GL renderer are not enabled in this build"
+                )
+            }
 
             // 5. Stage the existing installation as a rollback backup.
             val target = File(filtersDirectory, definition.id)

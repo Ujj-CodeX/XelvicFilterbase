@@ -26,18 +26,21 @@ class RenderBackendRouterTest {
         coordinates = List(FaceMeshTessellation.LANDMARK_COUNT) {
             FaceUvCoordinate(0.5f, 0.5f)
         },
-        uvOrigin = UvOrigin.BOTTOM_LEFT
+        uvOrigin = UvOrigin.BOTTOM_LEFT,
+        uvLayoutId = "unit-test-layout"
     ).uvMap!!
 
     private fun meshRequirements(
         map: FaceMeshUvMap? = uvMap,
         modelSha: String? = modelHash,
         topology: String = FaceMeshTessellation.TOPOLOGY_ID,
+        uvLayoutId: String? = "unit-test-layout",
         width: Int = 512,
         height: Int = 512,
         requiresDepth: Boolean = false
     ) = FaceMeshTextureRequirements(
         topologyId = topology,
+        uvLayoutId = uvLayoutId,
         activeModelAssetSha256 = modelSha,
         uvMap = map,
         textureWidth = width,
@@ -79,6 +82,18 @@ class RenderBackendRouterTest {
 
         assertEquals(RenderBackend.FACE_MESH_GL, result.backend)
         assertEquals(RenderBackendBlockReason.NONE, result.reason)
+    }
+
+    @Test
+    fun differentUvLayoutBlocksMeshRendering() {
+        val result = RenderBackendRouter.select(
+            EffectRenderIntent.FACE_MESH_TEXTURE,
+            meshRequirements(uvLayoutId = "different-layout"),
+            capabilities
+        )
+
+        assertEquals(RenderBackend.UNAVAILABLE, result.backend)
+        assertEquals(RenderBackendBlockReason.UV_LAYOUT_MISMATCH, result.reason)
     }
 
     @Test
