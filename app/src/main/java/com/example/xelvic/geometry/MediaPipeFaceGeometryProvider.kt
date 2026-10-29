@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
-import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -14,7 +13,6 @@ import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -38,7 +36,7 @@ class MediaPipeFaceGeometryProvider(
     private val inferenceInFlight = AtomicBoolean(false)
     private val lastTimestampMs = AtomicLong(-1L)
     private val pendingFrame = AtomicReference<PendingFrame?>(null)
-    private val resultListener = AtomicReference<(FaceGeometrySnapshot?) -> Unit>({})
+    private val resultListener = AtomicReference<(FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit>({ _, _ -> })
     private val errorListener = AtomicReference<((Throwable) -> Unit)?>(null)
 
     private val landmarker: FaceLandmarker
@@ -67,7 +65,9 @@ class MediaPipeFaceGeometryProvider(
         landmarker = FaceLandmarker.createFromOptions(appContext, options)
     }
 
-    override fun setResultListener(listener: (FaceGeometrySnapshot?) -> Unit) {
+    override fun setResultListener(
+        listener: (FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit
+    ) {
         resultListener.set(listener)
     }
 
@@ -78,7 +78,8 @@ class MediaPipeFaceGeometryProvider(
     override fun submitFrame(
         imageProxy: ImageProxy,
         timestampMs: Long,
-        isMirrored: Boolean
+        isMirrored: Boolean,
+        displayTransform: FaceGeometryDisplayTransform?
     ) {
         if (closed.get()) {
             closeProxySafely(imageProxy)
@@ -106,8 +107,8 @@ class MediaPipeFaceGeometryProvider(
             val sourceHeight = imageProxy.height
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
-            imageProxy.close()
             proxyClosed = true
+            imageProxy.close()
 
             inferenceBitmap = rotateUpright(sourceBitmap, rotationDegrees)
             if (inferenceBitmap !== sourceBitmap) {
@@ -125,6 +126,7 @@ class MediaPipeFaceGeometryProvider(
                 imageHeight = inferenceBitmap.height,
                 rotationDegrees = rotationDegrees,
                 isMirrored = isMirrored,
+                displayTransform = displayTransform,
                 bitmap = inferenceBitmap,
                 mpImage = mpImage
             )
@@ -139,12 +141,16 @@ class MediaPipeFaceGeometryProvider(
 
             landmarker.detectAsync(frame.mpImage, frame.timestampMs)
         } catch (error: Exception) {
-            if (!proxyClosed) closeProxySafely(imageProxy)
             sourceBitmap?.recycle()
             inferenceBitmap?.recycle()
             pendingFrame.getAndSet(null)?.release()
             inferenceInFlight.set(false)
             notifyError(error)
+        } finally {
+            if (!proxyClosed) {
+                proxyClosed = true
+                closeProxySafely(imageProxy)
+            }
         }
     }
 
@@ -152,7 +158,15 @@ class MediaPipeFaceGeometryProvider(
         val frame = pendingFrame.get() ?: return
         // A late callback must never consume a newer frame's resources.
         if (result.timestampMs() != frame.timestampMs) {
-            Log.w(TAG, "Ignoring stale result timestamp=${result.timestampMs()}, pending=${frame.timestampMs}")
+            if (pendingFrame.compareAndSet(frame, null)) {
+                frame.release()
+                inferenceInFlight.set(false)
+                notifyError(
+                    IllegalStateException(
+                        "MediaPipe result timestamp mismatch: result=${result.timestampMs()}, pending=${frame.timestampMs}"
+                    )
+                )
+            }
             return
         }
         if (!pendingFrame.compareAndSet(frame, null)) return
@@ -162,7 +176,7 @@ class MediaPipeFaceGeometryProvider(
 
             val faceLandmarks = result.faceLandmarks().firstOrNull()
             if (faceLandmarks.isNullOrEmpty()) {
-                notifyResult(null)
+                notifyResult(null, frame.displayTransform)
                 return
             }
 
@@ -203,7 +217,8 @@ class MediaPipeFaceGeometryProvider(
                     blendshapes = blendshapes,
                     facialTransformationMatrix = matrix,
                     topologyId = null
-                )
+                ),
+                frame.displayTransform
             )
         } catch (error: Exception) {
             notifyError(error)
@@ -219,9 +234,12 @@ class MediaPipeFaceGeometryProvider(
         notifyError(error)
     }
 
-    private fun notifyResult(snapshot: FaceGeometrySnapshot?) {
+    private fun notifyResult(
+        snapshot: FaceGeometrySnapshot?,
+        displayTransform: FaceGeometryDisplayTransform?
+    ) {
         try {
-            resultListener.get().invoke(snapshot)
+            resultListener.get().invoke(snapshot, displayTransform)
         } catch (error: Exception) {
             Log.e(TAG, "Face geometry result listener threw an exception", error)
         }
@@ -353,6 +371,7 @@ class MediaPipeFaceGeometryProvider(
         val imageHeight: Int,
         val rotationDegrees: Int,
         val isMirrored: Boolean,
+        val displayTransform: FaceGeometryDisplayTransform?,
         val bitmap: Bitmap,
         val mpImage: MPImage
     ) {
