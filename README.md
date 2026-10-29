@@ -187,13 +187,14 @@ For CameraX, prefer a shared `ViewPort`/`UseCaseGroup` where the chosen use case
 
 ## Mesh Topology and Texture Mapping
 
-MediaPipe Face Landmarker currently documents 478 3D landmarks and can optionally return 52 blendshape scores and a facial transformation matrix. These are model outputs, not a guarantee that any arbitrary 478-index triangle list/UV map is valid.
+MediaPipe Face Landmarker currently documents 478 3D landmarks and can optionally return 52 blendshape scores and a facial transformation matrix. These are model outputs, not a guarantee that any arbitrary 478-index triangle list/UV map is valid. The R1 wireframe uses the current Tasks API's own `face_landmarks_connections.h` tessellation, which indexes the 468-point face surface (indices 0–467); the additional iris landmarks are not part of this face-surface tessellation.
 
 Before mesh rendering:
 
 - Select and pin a specific compatible model/task version for the R&D branch.
-- Verify landmark ordering, canonical mesh topology, triangle index list, UV coordinates, vertex count, and matrix convention against that exact model/reference data.
-- Do not blindly combine the 478-landmark task result with an older 468-vertex canonical topology. Iris landmarks and face-surface topology require explicit compatibility handling.
+- R1 has pinned the Tasks API wireframe connectivity from `face_landmarks_connections.h`: 852 triangles / 1322 unique edges over indices 0–467. Unit tests validate index ranges, unique edge coverage, and expected counts. This validates the static connectivity asset, not physical-device alignment.
+- Before texturing, still verify the UV coordinate table and vertex/UV correspondence against the exact Face Landmarker task model. The legacy `canonical_face_model.obj` is a separate legacy Face Geometry asset; its topology/UV correspondence must not be assumed compatible with newer Tasks API output.
+- Iris indices 468–477 in the current 478-landmark result are rendered as points in R1 diagnostics but are intentionally excluded from the 468-point face-surface wireframe.
 - Keep topology and UV data versioned and cached; update live vertex buffers per tracking result.
 - Use a test texture/wireframe to validate every transform before enabling production effects.
 
