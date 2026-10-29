@@ -1,6 +1,7 @@
 package com.example.xelvic.camera
 
 import android.content.Context
+import android.graphics.Matrix
 import android.os.SystemClock
 import android.util.Log
 import android.view.View
@@ -14,12 +15,16 @@ import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.view.transform.CoordinateTransform
+import androidx.camera.view.transform.ImageProxyTransformFactory
+import androidx.camera.view.transform.OutputTransform
 import androidx.camera.view.TransformExperimental
 import androidx.core.content.ContextCompat
 import androidx.core.view.doOnAttach
 import androidx.core.view.doOnLayout
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
+import com.example.xelvic.geometry.FaceGeometryDisplayTransform
 import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.geometry.MediaPipeFaceGeometryProvider
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +32,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -88,10 +94,12 @@ class CameraController(
                 Log.w(TAG, "Failed to close frame while geometry provider is unavailable", error)
             }
         } else {
+            val frameTransform = computeGeometryDisplayTransform(imageProxy)
             activeProvider.submitFrame(
                 imageProxy = imageProxy,
                 timestampMs = SystemClock.uptimeMillis(),
-                isMirrored = _isFrontCamera.value
+                isMirrored = _isFrontCamera.value,
+                displayTransform = frameTransform
             )
         }
     }
@@ -121,6 +129,19 @@ class CameraController(
     private var previewStreamStateObserver:
             Observer<PreviewView.StreamState>? = null
 
+    @Volatile
+    private var cachedGeometryPreviewTransform: OutputTransform? = null
+
+    private val geometryImageTransformFactory =
+        ImageProxyTransformFactory().apply {
+            setUsingCropRect(false)
+            // MediaPipe receives a physically rotated bitmap, so its landmark coordinates
+            // are already in the upright image space. Do not rotate those points a second time.
+            setUsingRotationDegrees(false)
+        }
+
+    private val geometryTransformWarningLogged = AtomicBoolean(false)
+
     /**
      * Reads PreviewView.outputTransform only from the UI thread.
      *
@@ -130,9 +151,9 @@ class CameraController(
     private fun cachePreviewTransform(view: PreviewView) {
         if (observedPreviewView !== view) return
 
-        faceAnalyzer.updatePreviewOutputTransform(
-            view.outputTransform
-        )
+        val outputTransform = view.outputTransform
+        cachedGeometryPreviewTransform = outputTransform
+        faceAnalyzer.updatePreviewOutputTransform(outputTransform)
     }
 
     /**
@@ -154,6 +175,7 @@ class CameraController(
                 oldView.previewStreamState.removeObserver(observer)
             }
 
+            cachedGeometryPreviewTransform = null
             faceAnalyzer.updatePreviewOutputTransform(null)
         }
 
@@ -183,6 +205,7 @@ class CameraController(
                     // Invalidate stale transform when preview stops.
                     view.post {
                         if (observedPreviewView === view) {
+                            cachedGeometryPreviewTransform = null
                             faceAnalyzer.updatePreviewOutputTransform(null)
                         }
                     }
@@ -390,6 +413,39 @@ class CameraController(
     }
 
     /**
+     * Captures the mapping from this exact ImageProxy's upright image space to PreviewView.
+     * CoordinateTransform requires source and target OutputTransforms from the same ViewPort.
+     */
+    @TransformExperimental
+    private fun computeGeometryDisplayTransform(
+        imageProxy: ImageProxy
+    ): FaceGeometryDisplayTransform? {
+        val targetTransform = cachedGeometryPreviewTransform ?: return null
+
+        return try {
+            val sourceTransform =
+                geometryImageTransformFactory.getOutputTransform(imageProxy)
+            val cameraXTransform =
+                CoordinateTransform(sourceTransform, targetTransform)
+            val matrix = Matrix()
+            cameraXTransform.transform(matrix)
+
+            val values = FloatArray(9)
+            matrix.getValues(values)
+            FaceGeometryDisplayTransform(values.map { it })
+        } catch (error: Exception) {
+            if (geometryTransformWarningLogged.compareAndSet(false, true)) {
+                Log.w(
+                    TAG,
+                    "Exact MediaPipe-to-preview transform unavailable; using FILL_CENTER fallback",
+                    error
+                )
+            }
+            null
+        }
+    }
+
+    /**
      * Requests a transform refresh on the UI thread.
      */
     private fun viewRefresh(view: PreviewView) {
@@ -436,9 +492,9 @@ class CameraController(
                 var candidate: MediaPipeFaceGeometryProvider? = null
                 try {
                     candidate = MediaPipeFaceGeometryProvider(context.applicationContext)
-                    candidate.setResultListener { snapshot ->
+                    candidate.setResultListener { snapshot, displayTransform ->
                         if (geometryRequested && !released) {
-                            faceGeometryHolder.publish(snapshot)
+                            faceGeometryHolder.publish(snapshot, displayTransform)
                             val hasFace = snapshot != null
                             if (_isMediaPipeFaceTracked.value != hasFace) {
                                 _isMediaPipeFaceTracked.value = hasFace
@@ -547,6 +603,7 @@ class CameraController(
             _isMediaPipeFaceTracked.value = false
 
             // Drop transform from the previous camera configuration.
+            cachedGeometryPreviewTransform = null
             faceAnalyzer.updatePreviewOutputTransform(null)
 
             currentPreviewView?.let { view ->
@@ -650,6 +707,7 @@ class CameraController(
             previewLayoutChangeListener = null
             previewStreamStateObserver = null
 
+            cachedGeometryPreviewTransform = null
             faceAnalyzer.updatePreviewOutputTransform(null)
 
             cameraProvider?.unbindAll()
