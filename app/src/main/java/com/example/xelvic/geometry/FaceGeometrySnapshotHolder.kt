@@ -21,17 +21,32 @@ class FaceGeometryDisplayTransform(matrixValues: List<Float>) {
     }
 
     fun mapPixel(x: Float, y: Float): FaceGeometryProjection.Point? {
-        if (!x.isFinite() || !y.isFinite()) return null
+        val output = FloatArray(2)
+        if (!mapPixelInto(x, y, output)) return null
+        return FaceGeometryProjection.Point(output[0], output[1])
+    }
+
+    /** Maps into a caller-owned array to keep the live overlay allocation-light. */
+    fun mapPixelInto(
+        x: Float,
+        y: Float,
+        output: FloatArray,
+        offset: Int = 0
+    ): Boolean {
+        require(offset >= 0 && offset + 1 < output.size)
+        if (!x.isFinite() || !y.isFinite()) return false
 
         val m = matrixValues
         val denominator = m[6] * x + m[7] * y + m[8]
-        if (!denominator.isFinite() || kotlin.math.abs(denominator) < 1e-6f) return null
+        if (!denominator.isFinite() || kotlin.math.abs(denominator) < 1e-6f) return false
 
         val mappedX = (m[0] * x + m[1] * y + m[2]) / denominator
         val mappedY = (m[3] * x + m[4] * y + m[5]) / denominator
-        if (!mappedX.isFinite() || !mappedY.isFinite()) return null
+        if (!mappedX.isFinite() || !mappedY.isFinite()) return false
 
-        return FaceGeometryProjection.Point(mappedX, mappedY)
+        output[offset] = mappedX
+        output[offset + 1] = mappedY
+        return true
     }
 }
 
