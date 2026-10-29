@@ -28,7 +28,13 @@ internal fun FaceMeshTextureOverlay(
 
     AndroidView(
         factory = { context ->
-            FaceMeshGlOverlayView(context).also { viewRef[0] = it }
+            FaceMeshGlOverlayView(context).also { view ->
+                viewRef[0] = view
+                // This GL view may be created after Activity is already RESUMED.
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    view.onResume()
+                }
+            }
         },
         update = { view ->
             viewRef[0] = view

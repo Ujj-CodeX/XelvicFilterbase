@@ -19,25 +19,49 @@ import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
+import com.example.BuildConfig
+
+enum class FaceMeshTextureUvMode {
+    PINNED_CANONICAL,
+    DIAGNOSTIC_FACE_SPACE
+}
+
+internal const val DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID = "diagnostic_face_space_v1"
+internal const val DIAGNOSTIC_MOUSTACHE_FILTER_ID = "moustache_mesh_test"
 
 /**
  * Immutable render input. The caller retains Bitmap ownership and must keep it alive and
  * unmodified while this effect is active; GL upload/deletion happens only on the GL thread.
- * The UV map must come from FaceMeshUvRegistry, never directly from an imported .xfilter.
+ * Production UV maps must come from the app-owned FaceMeshUvRegistry, never from imported packages.
+ * The diagnostic UV mode is limited to the bundled debug moustache package.
  */
 data class FaceMeshGlEffect(
     val effectId: String,
     val topologyId: String,
     val uvLayoutId: String,
     val modelAssetSha256: String,
-    val uvMap: FaceMeshUvMap,
+    val uvMap: FaceMeshUvMap?
     val bitmap: Bitmap,
     val opacity: Float = 1f,
-    val requiresDepthOcclusion: Boolean = false
+    val requiresDepthOcclusion: Boolean = false,
+    val uvMode: FaceMeshTextureUvMode = FaceMeshTextureUvMode.PINNED_CANONICAL
 ) {
     init {
         require(effectId.isNotBlank()) { "Effect ID cannot be blank" }
         require(opacity.isFinite() && opacity in 0f..1f) { "Opacity must be within [0, 1]" }
+        when (uvMode) {
+            FaceMeshTextureUvMode.PINNED_CANONICAL ->
+                require(uvMap != null) { "Canonical texture effects require a validated UV map" }
+            FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE -> {
+                require(uvMap == null) { "Diagnostic face-space UVs are generated per frame" }
+                require(uvLayoutId == DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID) {
+                    "Diagnostic face-space mode requires its reserved layout ID"
+                }
+                require(effectId == DIAGNOSTIC_MOUSTACHE_FILTER_ID) {
+                    "Diagnostic face-space mode is reserved for the bundled moustache fixture"
+                }
+            }
+        }
     }
 }
 
@@ -222,7 +246,8 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             viewHeight = surfaceHeight,
             positionsNdc = positions,
             textureCoordinates = uvs,
-            mappedPoint = mappedPoint
+            mappedPoint = mappedPoint,
+            uvMode = effect.uvMode
         )
         if (!prepared) return
 
@@ -265,7 +290,10 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             uvMap = effect.uvMap,
             textureWidth = effect.bitmap.width,
             textureHeight = effect.bitmap.height,
-            requiresDepthOcclusion = effect.requiresDepthOcclusion
+            requiresDepthOcclusion = effect.requiresDepthOcclusion,
+            uvMode = effect.uvMode,
+            allowDiagnosticFaceSpace = BuildConfig.DEBUG &&
+                effect.effectId == DIAGNOSTIC_MOUSTACHE_FILTER_ID
         )
         val decision = RenderBackendRouter.select(
             intent = EffectRenderIntent.FACE_MESH_TEXTURE,

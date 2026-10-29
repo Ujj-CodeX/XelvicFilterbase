@@ -126,6 +126,17 @@ fun CameraScreen(
     val isMeshTextureSelected =
         selectedFilter?.definition?.renderer == FilterRenderer.FACE_MESH_TEXTURE
 
+    // Mesh packages need MediaPipe geometry; Canvas packages need the ML Kit pose stream.
+    LaunchedEffect(selectedFilter?.id, isMeshTextureSelected) {
+        val geometryEnabled = cameraController.isMediaPipeGeometryEnabled.value
+        when {
+            isMeshTextureSelected && !geometryEnabled ->
+                cameraController.setMediaPipeGeometryEnabled(true)
+            selectedFilter != null && !isMeshTextureSelected && geometryEnabled ->
+                cameraController.setMediaPipeGeometryEnabled(false)
+        }
+    }
+
     LaunchedEffect(
         selectedFilter?.id,
         isMeshTextureSelected,
@@ -176,7 +187,9 @@ fun CameraScreen(
         // 1. Camera Live Viewfinder
         CameraPreview(
             cameraController = cameraController,
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            // TextureView composes more reliably with overlays on devices reporting SurfaceOrderQuirk.
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         )
 
         // 2. Real-time 2D Filter Hardware-Accelerated Overlay
@@ -198,19 +211,23 @@ fun CameraScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        FaceMeshGlWireframeOverlay(
-            holder = cameraController.faceGeometryHolder,
-            enabled = isMediaPipeGeometryEnabled && showGlMeshOverlay,
-            modifier = Modifier.fillMaxSize()
-        )
+        if (isMediaPipeGeometryEnabled && showGlMeshOverlay) {
+            FaceMeshGlWireframeOverlay(
+                holder = cameraController.faceGeometryHolder,
+                enabled = true,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
-        // R6: Mesh-texture overlay integration
-        FaceMeshTextureOverlay(
-            holder = cameraController.faceGeometryHolder,
-            effect = activeMeshEffect,
-            enabled = isMediaPipeGeometryEnabled && isMeshTextureSelected,
-            modifier = Modifier.fillMaxSize()
-        )
+        // Mount a native GL surface only when a resolved mesh effect is ready to draw.
+        if (isMediaPipeGeometryEnabled && isMeshTextureSelected && activeMeshEffect != null) {
+            FaceMeshTextureOverlay(
+                holder = cameraController.faceGeometryHolder,
+                effect = activeMeshEffect,
+                enabled = true,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
 
 

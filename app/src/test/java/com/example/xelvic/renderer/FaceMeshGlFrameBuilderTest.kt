@@ -55,7 +55,7 @@ class FaceMeshGlFrameBuilderTest {
 
     private fun update(
         renderFrame: FaceGeometryRenderFrame? = frame(),
-        map: FaceMeshUvMap = uvMap,
+        map: FaceMeshUvMap? = uvMap,
         requiredLayout: String = layoutId,
         requiredModel: String = modelHash,
         requiredTopology: String = FaceMeshTessellation.TOPOLOGY_ID,
@@ -63,7 +63,8 @@ class FaceMeshGlFrameBuilderTest {
         height: Int = 100,
         positions: FloatArray = FloatArray(FaceMeshTessellation.LANDMARK_COUNT * 2),
         uvs: FloatArray = FloatArray(FaceMeshTessellation.LANDMARK_COUNT * 2),
-        mapped: FloatArray = FloatArray(2)
+        mapped: FloatArray = FloatArray(2),
+        uvMode: FaceMeshTextureUvMode = FaceMeshTextureUvMode.PINNED_CANONICAL
     ): Boolean = FaceMeshGlFrameBuilder.update(
         renderFrame = renderFrame,
         uvMap = map,
@@ -74,7 +75,8 @@ class FaceMeshGlFrameBuilderTest {
         viewHeight = height,
         positionsNdc = positions,
         textureCoordinates = uvs,
-        mappedPoint = mapped
+        mappedPoint = mapped,
+        uvMode = uvMode
     )
 
     @Test
@@ -109,5 +111,50 @@ class FaceMeshGlFrameBuilderTest {
         assertFalse(update(height = 0))
         assertFalse(update(positions = FloatArray(2)))
         assertFalse(update(uvs = FloatArray(2)))
+    }
+    @Test
+    fun diagnosticFaceSpaceModeBuildsUvsWithoutPinnedMap() {
+        val landmarks = List(FaceMeshTessellation.LANDMARK_COUNT) { index ->
+            val column = index % 18
+            val row = index / 18
+            FaceVertex(
+                x = 0.2f + column * 0.03f,
+                y = 0.1f + row * 0.035f,
+                z = 0f
+            )
+        }
+        val snapshot = FaceGeometrySnapshot(
+            timestampMs = 100L,
+            imageWidth = 100,
+            imageHeight = 100,
+            rotationDegrees = 0,
+            isMirrored = false,
+            landmarks = landmarks,
+            topologyId = FaceMeshTessellation.TOPOLOGY_ID,
+            modelAssetSha256 = modelHash
+        )
+        val positions = FloatArray(FaceMeshTessellation.LANDMARK_COUNT * 2)
+        val uvs = FloatArray(FaceMeshTessellation.LANDMARK_COUNT * 2)
+
+        assertTrue(
+            FaceMeshGlFrameBuilder.update(
+                renderFrame = FaceGeometryRenderFrame(snapshot, identityTransform),
+                uvMap = null,
+                requiredUvLayoutId = DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID,
+                requiredModelAssetSha256 = modelHash,
+                requiredTopologyId = FaceMeshTessellation.TOPOLOGY_ID,
+                viewWidth = 100,
+                viewHeight = 100,
+                positionsNdc = positions,
+                textureCoordinates = uvs,
+                mappedPoint = FloatArray(2),
+                uvMode = FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE
+            )
+        )
+        assertEquals(0f, uvs[0], 0.0001f)
+        assertEquals(0f, uvs[1], 0.0001f)
+        val lastOffset = (FaceMeshTessellation.LANDMARK_COUNT - 1) * 2
+        assertEquals(1f, uvs[lastOffset], 0.0001f)
+        assertEquals(1f, uvs[lastOffset + 1], 0.0001f)
     }
 }

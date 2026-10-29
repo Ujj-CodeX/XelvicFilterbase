@@ -31,16 +31,20 @@ fun FaceMeshGlWireframeOverlay(
                 Lifecycle.Event.ON_PAUSE -> glView.onPause()
                 Lifecycle.Event.ON_DESTROY -> {
                     glView.setSnapshotHolder(null)
-                    glView.setEnabled(false)
+                    glView.setOverlayEnabled(false)
                 }
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
+        // This overlay may be mounted after Activity ON_RESUME has already fired.
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            glView.onResume()
+        }
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             glView.setSnapshotHolder(null)
-            glView.setEnabled(false)
+            glView.setOverlayEnabled(false)
             glView.onPause()
         }
     }
@@ -48,7 +52,7 @@ fun FaceMeshGlWireframeOverlay(
     AndroidView(
         factory = { glView },
         update = { view ->
-            view.setEnabled(enabled)
+            view.setOverlayEnabled(enabled)
             view.setSnapshotHolder(if (enabled) holder else null)
         },
         modifier = modifier.testTag("face_mesh_gl_wireframe_overlay")

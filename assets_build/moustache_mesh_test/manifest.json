@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "id": "moustache_mesh_test",
+  "name": "Mesh Moustache (R&D)",
+  "version": "1.0.0",
+  "description": "Debug-only face-space UV test texture for the GLES face mesh pipeline; not a production canonical UV layout.",
+  "minimumRuntimeVersion": 2,
+  "thumbnail": "thumbnail.png",
+  "renderer": "FACE_MESH_TEXTURE",
+  "meshTexture": {
+    "asset": "assets/moustache.png",
+    "uvLayout": "diagnostic_face_space_v1",
+    "blendMode": "NORMAL",
+    "opacity": 1.0
+  }
+}

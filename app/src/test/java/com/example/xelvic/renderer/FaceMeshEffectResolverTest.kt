@@ -46,11 +46,12 @@ class FaceMeshEffectResolverTest {
 
     private fun installed(
         renderer: FilterRenderer,
-        mesh: MeshTextureDefinition? = null
+        mesh: MeshTextureDefinition? = null,
+        id: String = "test-filter"
     ): InstalledFilter {
         val definition = FilterDefinition(
             schemaVersion = if (renderer == FilterRenderer.CANVAS) 1 else 2,
-            id = "test-filter",
+            id = id,
             name = "Test filter",
             version = "1.0",
             description = "",
@@ -186,5 +187,29 @@ class FaceMeshEffectResolverTest {
             FaceMeshEffectResolution.Blocked(FaceMeshEffectBlockReason.TEXTURE_ASSET_MISSING),
             result
         )
+    }
+    @Test
+    fun bundledDebugMoustacheUsesDiagnosticGlesUvModeWithoutPretendingUvIsPinned() {
+        val resolver = FaceMeshEffectResolver(
+            loadUvMap = { _, _ -> error("diagnostic fixture must not load canonical UVs") },
+            loadBitmap = { _, _ -> bitmap },
+            diagnosticFaceSpaceEnabled = true
+        )
+        val result = resolver.resolve(
+            installed(
+                renderer = FilterRenderer.FACE_MESH_TEXTURE,
+                mesh = meshSpec(layout = DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID),
+                id = DIAGNOSTIC_MOUSTACHE_FILTER_ID
+            ),
+            activeModelAssetSha256 = modelSha
+        )
+
+        assertTrue(result is FaceMeshEffectResolution.Ready)
+        val effect = (result as FaceMeshEffectResolution.Ready).effect
+        assertEquals(DIAGNOSTIC_MOUSTACHE_FILTER_ID, effect.effectId)
+        assertEquals(DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID, effect.uvLayoutId)
+        assertEquals(FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE, effect.uvMode)
+        assertEquals(null, effect.uvMap)
+        assertSame(bitmap, effect.bitmap)
     }
 }

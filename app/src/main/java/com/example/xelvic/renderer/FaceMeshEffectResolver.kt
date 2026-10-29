@@ -1,6 +1,7 @@
 package com.example.xelvic.renderer
 
 import android.graphics.Bitmap
+import com.example.BuildConfig
 import com.example.xelvic.geometry.FaceMeshTessellation
 import com.example.xelvic.geometry.FaceMeshUvAssetFailure
 import com.example.xelvic.geometry.FaceMeshUvAssetResult
@@ -36,18 +37,16 @@ sealed interface FaceMeshEffectResolution {
 }
 
 /**
- * Resolves parsed .xfilter metadata into a renderer input only after the UV layout has been
- * loaded from the app-owned pinned registry and validated against the active Face Landmarker task.
- *
- * This class does not decide OpenGL/device capability; FaceMeshGlOverlayView's renderer router
- * performs that check again immediately before upload/draw. It also intentionally rejects
- * regionMask because the R3 shader does not implement region-mask sampling yet.
+ * Production .xfilter mesh effects are accepted only after the app-owned UV registry validates
+ * the exact model/topology pair. Only the bundled moustache fixture in debug builds can use
+ * diagnostic face-space UVs to exercise the GLES texture pipeline without claiming canonical UVs.
  */
 class FaceMeshEffectResolver(
     private val loadUvMap: (layoutId: String, activeModelAssetSha256: String?) -> FaceMeshUvAssetResult,
     private val loadBitmap: (InstalledFilter, assetPath: String) -> Bitmap? = { filter, path ->
         filter.getAssetBitmap(path)
-    }
+    },
+    private val diagnosticFaceSpaceEnabled: Boolean = BuildConfig.DEBUG
 ) {
     constructor(registry: FaceMeshUvRegistry) : this(registry::load)
 
@@ -65,9 +64,40 @@ class FaceMeshEffectResolver(
         val mesh = definition.meshTexture
             ?: return blocked(FaceMeshEffectBlockReason.MISSING_MESH_METADATA)
 
-        // The current GLES shader does not sample region masks. Do not silently ignore metadata.
         if (mesh.regionMask != null) {
             return blocked(FaceMeshEffectBlockReason.UNSUPPORTED_REGION_MASK)
+        }
+
+        if (
+            definition.id == DIAGNOSTIC_MOUSTACHE_FILTER_ID &&
+            mesh.uvLayout == DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID
+        ) {
+            if (!diagnosticFaceSpaceEnabled) {
+                return blocked(FaceMeshEffectBlockReason.UV_LAYOUT_NOT_REGISTERED)
+            }
+            val activeModelSha = activeModelAssetSha256
+                ?: return blocked(FaceMeshEffectBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)
+            if (!activeModelSha.isSha256()) {
+                return blocked(FaceMeshEffectBlockReason.INVALID_ACTIVE_MODEL_IDENTITY)
+            }
+            val bitmap = loadBitmap(filter, mesh.asset)
+                ?: return blocked(FaceMeshEffectBlockReason.TEXTURE_ASSET_MISSING)
+            if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) {
+                return blocked(FaceMeshEffectBlockReason.TEXTURE_BITMAP_INVALID)
+            }
+            return FaceMeshEffectResolution.Ready(
+                FaceMeshGlEffect(
+                    effectId = definition.id,
+                    topologyId = FaceMeshTessellation.TOPOLOGY_ID,
+                    uvLayoutId = mesh.uvLayout,
+                    modelAssetSha256 = activeModelSha,
+                    uvMap = null,
+                    bitmap = bitmap,
+                    opacity = mesh.opacity,
+                    requiresDepthOcclusion = false,
+                    uvMode = FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE
+                )
+            )
         }
 
         val activeModelSha = activeModelAssetSha256
@@ -107,7 +137,8 @@ class FaceMeshEffectResolver(
                 uvMap = uvMap,
                 bitmap = bitmap,
                 opacity = mesh.opacity,
-                requiresDepthOcclusion = false
+                requiresDepthOcclusion = false,
+                uvMode = FaceMeshTextureUvMode.PINNED_CANONICAL
             )
         )
     }

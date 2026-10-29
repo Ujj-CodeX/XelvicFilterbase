@@ -37,7 +37,9 @@ class RenderBackendRouterTest {
         uvLayoutId: String? = "unit-test-layout",
         width: Int = 512,
         height: Int = 512,
-        requiresDepth: Boolean = false
+        requiresDepth: Boolean = false,
+        uvMode: FaceMeshTextureUvMode = FaceMeshTextureUvMode.PINNED_CANONICAL,
+        allowDiagnostic: Boolean = false
     ) = FaceMeshTextureRequirements(
         topologyId = topology,
         uvLayoutId = uvLayoutId,
@@ -45,7 +47,9 @@ class RenderBackendRouterTest {
         uvMap = map,
         textureWidth = width,
         textureHeight = height,
-        requiresDepthOcclusion = requiresDepth
+        requiresDepthOcclusion = requiresDepth,
+        uvMode = uvMode,
+        allowDiagnosticFaceSpace = allowDiagnostic
     )
 
     @Test
@@ -154,5 +158,33 @@ class RenderBackendRouterTest {
 
         assertEquals(RenderBackend.UNAVAILABLE, result.backend)
         assertEquals(RenderBackendBlockReason.INVALID_TEXTURE_DIMENSIONS, result.reason)
+    }
+    @Test
+    fun diagnosticFaceSpaceModeIsExplicitAndDebugGated() {
+        val allowed = RenderBackendRouter.select(
+            EffectRenderIntent.FACE_MESH_TEXTURE,
+            meshRequirements(
+                map = null,
+                uvLayoutId = DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID,
+                uvMode = FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE,
+                allowDiagnostic = true
+            ),
+            capabilities
+        )
+        assertEquals(RenderBackend.FACE_MESH_GL, allowed.backend)
+        assertEquals(RenderBackendBlockReason.NONE, allowed.reason)
+
+        val blocked = RenderBackendRouter.select(
+            EffectRenderIntent.FACE_MESH_TEXTURE,
+            meshRequirements(
+                map = null,
+                uvLayoutId = DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID,
+                uvMode = FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE,
+                allowDiagnostic = false
+            ),
+            capabilities
+        )
+        assertEquals(RenderBackend.UNAVAILABLE, blocked.backend)
+        assertEquals(RenderBackendBlockReason.UV_MAP_NOT_VALIDATED, blocked.reason)
     }
 }

@@ -30,7 +30,7 @@ The current repository version catalog/configuration lists the following baselin
 | Application ID | `com.aistudio.xelvic.krvpmz` |
 | Namespace | `com.example` |
 
-The production baseline remains ML Kit and is unchanged. The R&D branch pins `com.google.mediapipe:tasks-vision:1.1.1` and includes an opt-in `CameraController` route to `MediaPipeFaceGeometryProvider` for diagnostics; normal startup still uses ML Kit. The model asset itself is not committed. Place `face_landmarker.task` in `app/src/main/assets/` using the instructions in that directory.
+The production baseline remains ML Kit and is unchanged. The R&D branch pins `com.google.mediapipe:tasks-vision:1.1.1` and includes an opt-in `CameraController` route to `MediaPipeFaceGeometryProvider` for diagnostics; normal startup still uses ML Kit unless a mesh-renderer filter is selected. The `face_landmarker.task` model asset is bundled in `app/src/main/assets/` on this research branch, and its SHA-256 is attached to geometry snapshots so compatible UV assets can be pinned. On-device geometry accuracy and performance remain to be measured.
 
 ## Current Baseline vs. Mesh Engine R&D
 

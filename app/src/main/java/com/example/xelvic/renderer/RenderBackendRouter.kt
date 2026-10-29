@@ -45,7 +45,9 @@ data class FaceMeshTextureRequirements(
     val uvMap: FaceMeshUvMap?,
     val textureWidth: Int,
     val textureHeight: Int,
-    val requiresDepthOcclusion: Boolean = false
+    val requiresDepthOcclusion: Boolean = false,
+    val uvMode: FaceMeshTextureUvMode = FaceMeshTextureUvMode.PINNED_CANONICAL,
+    val allowDiagnosticFaceSpace: Boolean = false
 )
 
 data class RenderBackendDecision(
@@ -54,10 +56,9 @@ data class RenderBackendDecision(
 )
 
 /**
- * Selects a renderer without silently degrading a face-surface texture into a flat sticker.
- *
- * Legacy v1 .xfilter layers remain on Canvas. A mesh-texture effect is unavailable until its UV
- * asset matches the active model and topology and the device can support its texture requirements.
+ * Production mesh textures require a model-pinned UV layout. A narrowly scoped debug fixture can
+ * opt into per-frame face-space UVs to exercise GLES texture upload/drawing; this path is gated
+ * by the resolver and renderer to the bundled test package and debug builds only.
  */
 object RenderBackendRouter {
 
@@ -69,30 +70,50 @@ object RenderBackendRouter {
         if (intent == EffectRenderIntent.LEGACY_2D) {
             return RenderBackendDecision(RenderBackend.CANVAS)
         }
-
         if (mesh == null) return blocked(RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING)
-
-        val uvMap = mesh.uvMap
-            ?: return blocked(RenderBackendBlockReason.UV_MAP_NOT_VALIDATED)
 
         val requiredUvLayoutId = mesh.uvLayoutId?.takeIf { it.isNotBlank() }
             ?: return blocked(RenderBackendBlockReason.UV_LAYOUT_MISMATCH)
-        if (uvMap.uvLayoutId != requiredUvLayoutId) {
-            return blocked(RenderBackendBlockReason.UV_LAYOUT_MISMATCH)
-        }
 
-        if (mesh.activeModelAssetSha256 == null) {
-            return blocked(RenderBackendBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)
-        }
-        if (uvMap.modelAssetSha256 != mesh.activeModelAssetSha256) {
-            return blocked(RenderBackendBlockReason.MODEL_MISMATCH)
-        }
-        if (
-            mesh.topologyId != FaceMeshTessellation.TOPOLOGY_ID ||
-            uvMap.topologyId != mesh.topologyId ||
-            uvMap.vertexCount != FaceMeshTessellation.LANDMARK_COUNT
-        ) {
-            return blocked(RenderBackendBlockReason.TOPOLOGY_MISMATCH)
+        when (mesh.uvMode) {
+            FaceMeshTextureUvMode.PINNED_CANONICAL -> {
+                val uvMap = mesh.uvMap
+                    ?: return blocked(RenderBackendBlockReason.UV_MAP_NOT_VALIDATED)
+                if (uvMap.uvLayoutId != requiredUvLayoutId) {
+                    return blocked(RenderBackendBlockReason.UV_LAYOUT_MISMATCH)
+                }
+                if (mesh.activeModelAssetSha256 == null) {
+                    return blocked(RenderBackendBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)
+                }
+                if (uvMap.modelAssetSha256 != mesh.activeModelAssetSha256) {
+                    return blocked(RenderBackendBlockReason.MODEL_MISMATCH)
+                }
+                if (
+                    mesh.topologyId != FaceMeshTessellation.TOPOLOGY_ID ||
+                    uvMap.topologyId != mesh.topologyId ||
+                    uvMap.vertexCount != FaceMeshTessellation.LANDMARK_COUNT
+                ) {
+                    return blocked(RenderBackendBlockReason.TOPOLOGY_MISMATCH)
+                }
+            }
+            FaceMeshTextureUvMode.DIAGNOSTIC_FACE_SPACE -> {
+                if (!mesh.allowDiagnosticFaceSpace ||
+                    mesh.uvMap != null ||
+                    requiredUvLayoutId != DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID
+                ) {
+                    return blocked(RenderBackendBlockReason.UV_MAP_NOT_VALIDATED)
+                }
+                val activeHash = mesh.activeModelAssetSha256
+                    ?: return blocked(RenderBackendBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)
+                if (activeHash.length != 64 ||
+                    !activeHash.all { it in '0'..'9' || it in 'a'..'f' }
+                ) {
+                    return blocked(RenderBackendBlockReason.ACTIVE_MODEL_IDENTITY_MISSING)
+                }
+                if (mesh.topologyId != FaceMeshTessellation.TOPOLOGY_ID) {
+                    return blocked(RenderBackendBlockReason.TOPOLOGY_MISMATCH)
+                }
+            }
         }
 
         if (capabilities.openGlEsMajorVersion < 2) {
