@@ -103,31 +103,29 @@ class MediaPipeFaceGeometryProvider(
             }
 
             sourceBitmap = yuv420888ToBitmap(imageProxy)
-            val sourceWidth = imageProxy.width
-            val sourceHeight = imageProxy.height
+            val sourceBitmapOwned = checkNotNull(sourceBitmap)
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
             proxyClosed = true
             imageProxy.close()
 
-            inferenceBitmap = rotateUpright(sourceBitmap, rotationDegrees)
-            if (inferenceBitmap !== sourceBitmap) {
-                sourceBitmap.recycle()
-                sourceBitmap = null
-            } else {
-                sourceBitmap = null // inferenceBitmap now owns this bitmap
+            val rotatedBitmap = rotateUpright(sourceBitmapOwned, rotationDegrees)
+            if (rotatedBitmap !== sourceBitmapOwned) {
+                sourceBitmapOwned.recycle()
             }
+            sourceBitmap = null
+            inferenceBitmap = rotatedBitmap
 
             val timestamp = monotonicTimestamp(timestampMs)
-            val mpImage = BitmapImageBuilder(inferenceBitmap).build()
+            val mpImage = BitmapImageBuilder(rotatedBitmap).build()
             val frame = PendingFrame(
                 timestampMs = timestamp,
-                imageWidth = inferenceBitmap.width,
-                imageHeight = inferenceBitmap.height,
+                imageWidth = rotatedBitmap.width,
+                imageHeight = rotatedBitmap.height,
                 rotationDegrees = rotationDegrees,
                 isMirrored = isMirrored,
                 displayTransform = displayTransform,
-                bitmap = inferenceBitmap,
+                bitmap = rotatedBitmap,
                 mpImage = mpImage
             )
             inferenceBitmap = null // ownership transferred to PendingFrame
