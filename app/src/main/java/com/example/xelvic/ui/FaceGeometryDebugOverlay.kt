@@ -26,6 +26,7 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
     @Volatile
     var snapshotHolder: FaceGeometrySnapshotHolder? = null
         set(value) {
+            if (field === value) return
             field?.onSnapshotUpdated = null
             field = value
             value?.onSnapshotUpdated = { postInvalidateOnAnimation() }
@@ -35,6 +36,7 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
     @Volatile
     var geometryDebugEnabled: Boolean = false
         set(value) {
+            if (field == value) return
             field = value
             if (!value) snapshotHolder?.clear()
             invalidate()
