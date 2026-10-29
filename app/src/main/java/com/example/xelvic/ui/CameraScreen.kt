@@ -272,8 +272,13 @@ fun CameraScreen(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = when {\n                            isMediaPipeGeometryEnabled && isMediaPipeFaceTracked -> "MediaPipe Face Locked"\n                            isMediaPipeGeometryEnabled -> "MediaPipe: Searching…"\n                            isFaceLocked -> "Face Locked"\n                            else -> "Searching Face…"\n                        },
-                        color = if (isFaceLocked) Color(0xFFD1FAE5) else Color(0xFFCBD5E1),
+                        text = when {
+                            isMediaPipeGeometryEnabled && isMediaPipeFaceTracked -> "MediaPipe Face Locked"
+                            isMediaPipeGeometryEnabled -> "MediaPipe: Searching…"
+                            isFaceLocked -> "Face Locked"
+                            else -> "Searching Face…"
+                        },
+                        color = if (faceLockedForDisplay) Color(0xFFD1FAE5) else Color(0xFFCBD5E1),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Medium
                     )
