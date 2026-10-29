@@ -58,23 +58,31 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (!geometryDebugEnabled) return
 
-        val snapshot = snapshotHolder?.getLatest()
-        if (snapshot == null) {
+        val renderFrame = snapshotHolder?.getLatest()
+        val snapshot = renderFrame?.snapshot
+        if (renderFrame == null || snapshot == null) {
             drawHud(canvas, "MediaPipe geometry: waiting for face…")
             return
         }
 
-        val widthPx = width
-        val heightPx = height
         for (vertex in snapshot.landmarks) {
-            val point = FaceGeometryProjection.projectFillCenter(
-                vertex = vertex,
-                imageWidth = snapshot.imageWidth,
-                imageHeight = snapshot.imageHeight,
-                viewWidth = widthPx,
-                viewHeight = heightPx,
-                mirrorHorizontally = snapshot.isMirrored
-            ) ?: continue
+            // Use the exact transform captured with this inference frame whenever available.
+            // The fallback mirrors only at the display boundary and is intentionally approximate.
+            val point = if (renderFrame.imageToPreview != null) {
+                renderFrame.imageToPreview.mapPixel(
+                    vertex.x * snapshot.imageWidth,
+                    vertex.y * snapshot.imageHeight
+                )
+            } else {
+                FaceGeometryProjection.projectFillCenter(
+                    vertex = vertex,
+                    imageWidth = snapshot.imageWidth,
+                    imageHeight = snapshot.imageHeight,
+                    viewWidth = width,
+                    viewHeight = height,
+                    mirrorHorizontally = snapshot.isMirrored
+                )
+            } ?: continue
 
             // Clipping is handled by Canvas; invalid or off-view coordinates are not clamped.
             canvas.drawCircle(point.x, point.y, pointRadiusPx, pointPaint)
