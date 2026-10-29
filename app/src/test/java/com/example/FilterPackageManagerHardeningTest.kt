@@ -4,6 +4,7 @@ package com.example
 import android.content.Context
 import com.example.xelvic.packagemanager.FilterPackageException
 import com.example.xelvic.packagemanager.FilterPackageManager
+import com.example.xelvic.model.FilterRenderer
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -86,6 +87,23 @@ class FilterPackageManagerHardeningTest {
             installed.packageDirectory,
             "manifest.json"
         ).readText()
+    }
+
+    @Test
+    fun bundledDebugMoustacheFixtureIsInstalledAndListed() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = FilterPackageManager(context)
+
+        // Ensure this exercises asset installation rather than reusing a prior test's directory.
+        manager.removeFilter("moustache_mesh_test")
+        val installed = manager.installBundledFiltersIfNecessary()
+        val moustache = installed.firstOrNull { it.id == "moustache_mesh_test" }
+
+        assertNotNull("bundled R&D moustache should be visible in the filter list", moustache)
+        assertEquals(FilterRenderer.FACE_MESH_TEXTURE, moustache!!.definition.renderer)
+        assertEquals("diagnostic_face_space_v1", moustache.definition.meshTexture?.uvLayout)
+        assertTrue(File(moustache.packageDirectory, "assets/moustache.png").isFile)
+        assertTrue(moustache.thumbnailFile.isFile)
     }
 
     @Test

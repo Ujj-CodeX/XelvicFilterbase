@@ -3,7 +3,11 @@ package com.example.xelvic.packagemanager
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import com.example.BuildConfig
 import com.example.xelvic.model.FilterDefinition
+import com.example.xelvic.model.FilterRenderer
+import com.example.xelvic.renderer.DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID
+import com.example.xelvic.renderer.DIAGNOSTIC_MOUSTACHE_FILTER_ID
 import com.example.xelvic.model.InstalledFilter
 import java.io.File
 import java.io.FileInputStream
@@ -559,11 +563,24 @@ class FilterPackageManager(private val context: Context) {
             // 4. Validate every referenced file before replacing anything.
             validatePackageAssets(tempDir, definition)
 
-            // Fail closed: this app build has no model-pinned UV registry or live GL mesh renderer.
-            if (definition.renderer == com.example.xelvic.model.FilterRenderer.FACE_MESH_TEXTURE) {
-                throw FilterPackageException(
-                    "FACE_MESH_TEXTURE packages are not installable yet; the UV registry and GL renderer are not enabled in this build"
-                )
+            // Permit only the repository-bundled debug fixture while canonical UV registration is pending.
+            // User-imported and all other mesh packages remain fail-closed until their UV layout is pinned.
+            if (definition.renderer == FilterRenderer.FACE_MESH_TEXTURE) {
+                val mesh = definition.meshTexture
+                val isBundledDiagnosticFixture =
+                    BuildConfig.DEBUG &&
+                    isBundled &&
+                    definition.id == DIAGNOSTIC_MOUSTACHE_FILTER_ID &&
+                    mesh != null &&
+                    mesh.uvLayout == DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID &&
+                    mesh.asset == "assets/moustache.png" &&
+                    mesh.regionMask == null
+
+                if (!isBundledDiagnosticFixture) {
+                    throw FilterPackageException(
+                        "FACE_MESH_TEXTURE packages are not installable yet except for the exact bundled debug moustache fixture; imported packages require a verified model-pinned UV layout"
+                    )
+                }
             }
 
             // 5. Stage the existing installation as a rollback backup.

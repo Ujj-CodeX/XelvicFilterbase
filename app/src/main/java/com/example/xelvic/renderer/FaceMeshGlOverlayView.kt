@@ -40,7 +40,7 @@ data class FaceMeshGlEffect(
     val topologyId: String,
     val uvLayoutId: String,
     val modelAssetSha256: String,
-    val uvMap: FaceMeshUvMap?
+    val uvMap: FaceMeshUvMap?,
     val bitmap: Bitmap,
     val opacity: Float = 1f,
     val requiresDepthOcclusion: Boolean = false,
@@ -66,8 +66,8 @@ data class FaceMeshGlEffect(
 }
 
 /**
- * Opt-in transparent Path-A overlay: place over PreviewView, below Compose controls.
- * This is an R&D renderer core, not yet wired to CameraScreen or the .xfilter selection flow.
+ * Transparent mesh-texture overlay placed over PreviewView only while a resolved mesh filter is active.
+ * The normal CameraScreen intentionally does not mount diagnostic wireframe surfaces.
  */
 class FaceMeshGlOverlayView @JvmOverloads constructor(
     context: Context,

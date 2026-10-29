@@ -135,9 +135,9 @@ class CameraController(
     private val geometryImageTransformFactory =
         ImageProxyTransformFactory().apply {
             setUsingCropRect(false)
-            // MediaPipe receives a physically rotated bitmap, so its landmark coordinates
-            // are already in the upright image space. Do not rotate those points a second time.
-            setUsingRotationDegrees(false)
+            // MediaPipe infers on a physically upright bitmap. Include ImageProxy rotation
+            // in its source transform so upright landmarks map into PreviewView exactly once.
+            setUsingRotationDegrees(true)
         }
 
     private val geometryTransformWarningLogged = AtomicBoolean(false)

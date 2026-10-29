@@ -39,7 +39,6 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
-import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.NotInterested
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -75,7 +74,6 @@ import com.example.xelvic.camera.FlashMode
 import com.example.xelvic.model.FaceTrackingResult
 import com.example.xelvic.model.InstalledFilter
 import com.example.xelvic.renderer.StickerRenderer
-import androidx.compose.material.icons.filled.GridOn
 import androidx.camera.view.TransformExperimental
 import com.example.xelvic.geometry.FaceMeshUvRegistry
 import com.example.xelvic.model.FilterRenderer
@@ -102,7 +100,6 @@ fun CameraScreen(
 ) {
     val flashMode by cameraController.flashMode.collectAsState()
     var showDebugOverlay by remember { mutableStateOf(false) }
-    var showGlMeshOverlay by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val isMediaPipeGeometryEnabled by cameraController.isMediaPipeGeometryEnabled.collectAsState()
@@ -125,6 +122,17 @@ fun CameraScreen(
 
     val isMeshTextureSelected =
         selectedFilter?.definition?.renderer == FilterRenderer.FACE_MESH_TEXTURE
+
+    // Mesh filters own the MediaPipe geometry session; Canvas filters return to ML Kit.
+    LaunchedEffect(selectedFilter?.id, isMeshTextureSelected) {
+        val geometryEnabled = cameraController.isMediaPipeGeometryEnabled.value
+        when {
+            isMeshTextureSelected && !geometryEnabled ->
+                cameraController.setMediaPipeGeometryEnabled(true)
+            !isMeshTextureSelected && geometryEnabled ->
+                cameraController.setMediaPipeGeometryEnabled(false)
+        }
+    }
 
     LaunchedEffect(
         selectedFilter?.id,
@@ -192,26 +200,16 @@ fun CameraScreen(
 
         )
 
-        // R1 Canvas diagnostic remains the reference overlay; the Grid toggle swaps to GPU edges.
-        FaceGeometryDebugOverlay(
-            holder = cameraController.faceGeometryHolder,
-            enabled = isMediaPipeGeometryEnabled && !showGlMeshOverlay,
-            modifier = Modifier.fillMaxSize()
-        )
-
-        FaceMeshGlWireframeOverlay(
-            holder = cameraController.faceGeometryHolder,
-            enabled = isMediaPipeGeometryEnabled && showGlMeshOverlay,
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // R6: Mesh-texture overlay integration
-        FaceMeshTextureOverlay(
-            holder = cameraController.faceGeometryHolder,
-            effect = activeMeshEffect,
-            enabled = isMediaPipeGeometryEnabled && isMeshTextureSelected,
-            modifier = Modifier.fillMaxSize()
-        )
+        // Mount a single transparent GL surface only after the mesh effect is ready.
+        // Diagnostic wireframes stay off the normal filter UI to protect PreviewView composition.
+        if (isMediaPipeGeometryEnabled && isMeshTextureSelected && activeMeshEffect != null) {
+            FaceMeshTextureOverlay(
+                holder = cameraController.faceGeometryHolder,
+                effect = activeMeshEffect,
+                enabled = true,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
 
 
@@ -281,37 +279,6 @@ fun CameraScreen(
                             imageVector = Icons.Default.BugReport,
                             contentDescription = "Developer Overlay",
                             tint = if (showDebugOverlay) Color(0xFFFFD54F) else Color(0xFF94A3B8),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    // Isolated R&D face-geometry path (replaces ML Kit for analysis while enabled).
-                    IconButton(
-                        onClick = {
-                            val enableGeometry = !isMediaPipeGeometryEnabled
-                            if (!enableGeometry) showGlMeshOverlay = false
-                            cameraController.setMediaPipeGeometryEnabled(enableGeometry)
-                        },
-                        modifier = Modifier.size(40.dp).testTag("mediapipe_geometry_toggle_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Face,
-                            contentDescription = "Toggle MediaPipe geometry diagnostics",
-                            tint = if (isMediaPipeGeometryEnabled) Color(0xFF00E5FF) else Color(0xFF94A3B8),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    // GPU wireframe diagnostics require MediaPipe geometry to be enabled first.
-                    IconButton(
-                        enabled = isMediaPipeGeometryEnabled,
-                        onClick = { showGlMeshOverlay = !showGlMeshOverlay },
-                        modifier = Modifier.size(40.dp).testTag("gl_mesh_debug_toggle_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.GridOn,
-                            contentDescription = "Toggle GPU face-mesh wireframe",
-                            tint = if (showGlMeshOverlay) Color(0xFFFF4FD8) else Color(0xFF94A3B8),
                             modifier = Modifier.size(20.dp)
                         )
                     }
