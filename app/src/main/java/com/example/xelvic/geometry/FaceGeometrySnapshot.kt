@@ -25,7 +25,9 @@ class FaceGeometrySnapshot(
     landmarks: List<FaceVertex>,
     blendshapes: List<BlendShapeValue> = emptyList(),
     facialTransformationMatrix: List<Float>? = null,
-    val topologyId: String? = null
+    val topologyId: String? = null,
+    /** SHA-256 of the exact Face Landmarker task bundle used for this result. */
+    val modelAssetSha256: String? = null
 ) {
     val landmarks: List<FaceVertex> =
         Collections.unmodifiableList(ArrayList(landmarks))
@@ -53,6 +55,13 @@ class FaceGeometrySnapshot(
                 rotationDegrees == 270
         ) {
             "Unsupported image rotation: $rotationDegrees"
+        }
+        require(
+            this.modelAssetSha256?.let { hash ->
+                hash.length == 64 && hash.all { char -> char in '0'..'9' || char in 'a'..'f' }
+            } != false
+        ) {
+            "Model asset SHA-256 must be a lowercase 64-character hexadecimal string"
         }
         require(this.landmarks.isNotEmpty()) {
             "A face snapshot must contain landmarks"
