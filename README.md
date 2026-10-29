@@ -537,12 +537,12 @@ Implemented on `research/face-mesh-texture-occlusion`:
 - Added unit tests for snapshot validation and immutability.
 - Added `app/src/main/assets/README.md` with the official model asset location.
 
-R1 implementation now adds the preview-mapping contract and a diagnostic point-cloud overlay. The CameraScreen has an opt-in Face button that swaps the single ImageAnalysis analyzer between MediaPipe and the existing ML Kit analyzer; it does not run both trackers simultaneously. If MediaPipe initialization or inference fails, the controller returns to ML Kit and surfaces an error.
+R1 implementation now includes an opt-in Face button and diagnostic point-cloud overlay. It swaps the single ImageAnalysis analyzer between MediaPipe and the existing ML Kit analyzer; the two trackers are not run simultaneously. Each submitted frame captures a CameraX `CoordinateTransform` from that ImageProxy to PreviewView, then carries the immutable 3×3 matrix with the asynchronous result so a later frame cannot accidentally supply its crop/mirror transform. If the exact transform is not available, the overlay falls back to the explicit `FILL_CENTER` approximation. If MediaPipe initialization or inference fails, the controller restores ML Kit and surfaces an error.
 
 Still pending / unverified:
 
 - The binary `face_landmarker.task` model must be downloaded to `app/src/main/assets/face_landmarker.task` locally. It is intentionally not included as a source-text file.
-- The point overlay currently uses the documented `FILL_CENTER` approximation and front-camera display mirror. Its alignment with the actual CameraX ViewPort/rotation must be validated on a physical device; if it is off, replace the prototype projection with per-frame CameraX `CoordinateTransform` data.
+- Coordinate projection now prefers a per-frame CameraX `CoordinateTransform`; the `FILL_CENTER` + manual-mirror mapping is only a fallback. Exact alignment still needs physical-device validation with front/rear camera, rotation and ViewPort crop, especially under PreviewView's configured implementation mode.
 - The app has not been built/tested against these new commits in the user's Android Studio environment during this change.
 - Device-level image orientation, inference latency, visual coordinate correctness, thermal cost and memory use remain to be measured.
 - Triangle topology and UV coordinates are not supplied/verified by the snapshot adapter. The R1 overlay intentionally draws landmarks only; do not render a mesh texture until canonical topology and UVs are pinned and validated against the selected model.
