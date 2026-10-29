@@ -1,6 +1,7 @@
 package com.example.xelvic.camera
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import androidx.camera.core.Camera
@@ -19,6 +20,10 @@ import androidx.core.view.doOnAttach
 import androidx.core.view.doOnLayout
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
+import com.example.xelvic.geometry.FaceGeometryProvider
+import com.example.xelvic.geometry.FaceGeometrySnapshot
+import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
+import com.example.xelvic.geometry.MediaPipeFaceGeometryProvider
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -52,6 +57,46 @@ class CameraController(
 
     private val cameraExecutor: ExecutorService =
         Executors.newSingleThreadExecutor()
+
+    /** Latest-only geometry handoff for the debug overlay; no frame queue is retained. */
+    val faceGeometryHolder = FaceGeometrySnapshotHolder()
+
+    private val _isMediaPipeGeometryEnabled = MutableStateFlow(false)
+    val isMediaPipeGeometryEnabled: StateFlow<Boolean> =
+        _isMediaPipeGeometryEnabled.asStateFlow()
+
+    private val _isMediaPipeFaceTracked = MutableStateFlow(false)
+    val isMediaPipeFaceTracked: StateFlow<Boolean> =
+        _isMediaPipeFaceTracked.asStateFlow()
+
+    private val _geometryError = MutableStateFlow<String?>(null)
+    val geometryError: StateFlow<String?> = _geometryError.asStateFlow()
+
+    @Volatile
+    private var geometryRequested = false
+
+    @Volatile
+    private var released = false
+
+    @Volatile
+    private var mediaPipeProvider: MediaPipeFaceGeometryProvider? = null
+
+    private val mediaPipeAnalyzer = ImageAnalysis.Analyzer { imageProxy ->
+        val activeProvider = mediaPipeProvider
+        if (!geometryRequested || activeProvider == null) {
+            try {
+                imageProxy.close()
+            } catch (error: Exception) {
+                Log.w(TAG, "Failed to close frame while geometry provider is unavailable", error)
+            }
+        } else {
+            activeProvider.submitFrame(
+                imageProxy = imageProxy,
+                timestampMs = SystemClock.uptimeMillis(),
+                isMirrored = _isFrontCamera.value
+            )
+        }
+    }
 
     private val _isFrontCamera = MutableStateFlow(true)
     val isFrontCamera: StateFlow<Boolean> =
@@ -281,7 +326,7 @@ class CameraController(
 
                     analysisUseCase.setAnalyzer(
                         cameraExecutor,
-                        faceAnalyzer
+                        activeImageAnalyzer()
                     )
                 }
 
@@ -356,6 +401,99 @@ class CameraController(
     }
 
     /**
+     * Opt-in R&D mode. It swaps the single ImageAnalysis analyzer rather than running
+     * ML Kit and MediaPipe simultaneously. The production ML Kit path remains the default.
+     */
+    fun setMediaPipeGeometryEnabled(enabled: Boolean) {
+        if (released) return
+
+        if (!enabled) {
+            geometryRequested = false
+            _isMediaPipeGeometryEnabled.value = false
+            _isMediaPipeFaceTracked.value = false
+            faceGeometryHolder.clear()
+            _geometryError.value = null
+
+            // Restore ML Kit immediately so new frames are no longer sent to MediaPipe.
+            imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
+            val previousProvider = mediaPipeProvider
+            mediaPipeProvider = null
+            try {
+                cameraExecutor.execute { previousProvider?.close() }
+            } catch (error: Exception) {
+                previousProvider?.close()
+            }
+            return
+        }
+
+        if (geometryRequested || _isMediaPipeGeometryEnabled.value) return
+
+        geometryRequested = true
+        _isMediaPipeGeometryEnabled.value = true
+        _geometryError.value = null
+        faceGeometryHolder.clear()
+
+        try {
+            cameraExecutor.execute {
+                var candidate: MediaPipeFaceGeometryProvider? = null
+                try {
+                    candidate = MediaPipeFaceGeometryProvider(context.applicationContext)
+                    candidate.setResultListener { snapshot ->
+                        if (geometryRequested && !released) {
+                            faceGeometryHolder.publish(snapshot)
+                            val hasFace = snapshot != null
+                            if (_isMediaPipeFaceTracked.value != hasFace) {
+                                _isMediaPipeFaceTracked.value = hasFace
+                            }
+                        }
+                    }
+                    candidate.setErrorListener { error ->
+                        if (geometryRequested && !released) {
+                            _geometryError.value =
+                                error.message ?: "MediaPipe geometry inference failed"
+                        }
+                    }
+
+                    if (!geometryRequested || released) {
+                        candidate.close()
+                        return@execute
+                    }
+
+                    mediaPipeProvider = candidate
+                    imageAnalysis?.setAnalyzer(cameraExecutor, mediaPipeAnalyzer)
+                    Log.i(TAG, "MediaPipe geometry diagnostics enabled")
+                } catch (error: Exception) {
+                    candidate?.close()
+                    geometryRequested = false
+                    mediaPipeProvider = null
+                    _isMediaPipeGeometryEnabled.value = false
+                    _isMediaPipeFaceTracked.value = false
+                    _geometryError.value =
+                        "Could not start MediaPipe: ${error.message ?: error.javaClass.simpleName}"
+                    imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
+                    Log.e(TAG, "Could not start MediaPipe geometry diagnostics", error)
+                }
+            }
+        } catch (error: Exception) {
+            geometryRequested = false
+            _isMediaPipeGeometryEnabled.value = false
+            _geometryError.value = "Camera analysis executor is unavailable"
+            Log.e(TAG, "Could not schedule MediaPipe initialization", error)
+        }
+    }
+
+    private fun activeImageAnalyzer(): ImageAnalysis.Analyzer =
+        if (
+            geometryRequested &&
+            _isMediaPipeGeometryEnabled.value &&
+            mediaPipeProvider != null
+        ) {
+            mediaPipeAnalyzer
+        } else {
+            faceAnalyzer
+        }
+
+    /**
      * Toggles between front and rear cameras.
      */
     fun toggleCamera() {
@@ -383,6 +521,8 @@ class CameraController(
 
             _isFrontCamera.value = newFacing
             faceAnalyzer.isFrontCamera = newFacing
+            faceGeometryHolder.clear()
+            _isMediaPipeFaceTracked.value = false
 
             // Drop transform from the previous camera configuration.
             faceAnalyzer.updatePreviewOutputTransform(null)
@@ -464,7 +604,15 @@ class CameraController(
      * Releases listeners, CameraX use cases, executor and face detector.
      */
     fun release() {
+        released = true
+        geometryRequested = false
+        _isMediaPipeGeometryEnabled.value = false
+        _isMediaPipeFaceTracked.value = false
+        faceGeometryHolder.onSnapshotUpdated = null
+        val providerToClose = mediaPipeProvider
+        mediaPipeProvider = null
         try {
+            providerToClose?.close()
             observedPreviewView?.let { view ->
 
                 previewLayoutChangeListener?.let { listener ->
