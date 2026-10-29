@@ -2,7 +2,7 @@
 
 **Xelvic** is a native Android camera and face-effects engine. The existing baseline uses CameraX, on-device ML Kit Face Detection, a data-driven `.xfilter` package format, and a Canvas-based 2D sticker renderer. The dedicated research direction is a **mesh-first face-effects engine**: persistent face tracking, UV-mapped 2D textures on a live 3D face surface, GPU rendering, and depth-based face occlusion.
 
-> **Status notice:** This README separates the production baseline from Mesh Engine R&D. R0.2 now adds a pinned MediaPipe Tasks Vision dependency, a geometry snapshot/provider contract, an isolated MediaPipe live-stream adapter, and snapshot unit tests on this research branch. The model binary must still be placed in `app/src/main/assets/face_landmarker.task`, and the adapter is not yet wired into the active camera path. Runtime geometry, GL rendering, mesh-texture schema extensions, rigidity research, and occlusion remain unvalidated. Physical-device performance figures are `NOT MEASURED` until measured.
+> **Status notice:** This README separates the production baseline from Mesh Engine R&D. R0.2 adds the MediaPipe provider/geometry contract; R1 adds opt-in CameraController routing, per-frame CameraX coordinate mapping, a wireframe diagnostic overlay, and topology tests. Normal startup still uses ML Kit. The MediaPipe route requires `app/src/main/assets/face_landmarker.task` and has not yet been verified on-device. GPU texture mapping, compatible UV data, occlusion, and physical-device performance remain unvalidated.
 
 ## Goals
 
@@ -122,7 +122,7 @@ Investigate whether a proven camera-to-GL path can be reused. If not, start with
 - **`PhotoProcessor`** — processes the captured photograph with the active effect.
 - **`MediaStoreSaver`** — stores processed photos in the gallery.
 
-### New R&D components (proposed, not assumed to exist yet)
+### New R&D components (current implementation status)
 
 - **`FaceGeometryProvider`** — interface separating the renderer from a specific tracking SDK.
 - **`MediaPipeFaceGeometryProvider`** — MediaPipe implementation with explicit lifecycle and live-stream timestamp handling.
