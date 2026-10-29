@@ -2,7 +2,7 @@
 
 **Xelvic** is a native Android camera and face-effects engine. The existing baseline uses CameraX, on-device ML Kit Face Detection, a data-driven `.xfilter` package format, and a Canvas-based 2D sticker renderer. The dedicated research direction is a **mesh-first face-effects engine**: persistent face tracking, UV-mapped 2D textures on a live 3D face surface, GPU rendering, and depth-based face occlusion.
 
-> **Status notice:** This README deliberately separates the existing codebase from the planned Mesh Engine R&D work. MediaPipe integration, the GPU mesh renderer, mesh-texture schema extensions, learned dynamic rigidity, and occlusion must not be treated as implemented or validated until the corresponding branch code and tests exist. Physical-device performance figures are marked `NOT MEASURED` until measured.
+> **Status notice:** This README separates the production baseline from Mesh Engine R&D. R0.2 now adds a pinned MediaPipe Tasks Vision dependency, a geometry snapshot/provider contract, an isolated MediaPipe live-stream adapter, and snapshot unit tests on this research branch. The model binary must still be placed in `app/src/main/assets/face_landmarker.task`, and the adapter is not yet wired into the active camera path. Runtime geometry, GL rendering, mesh-texture schema extensions, rigidity research, and occlusion remain unvalidated. Physical-device performance figures are `NOT MEASURED` until measured.
 
 ## Goals
 
@@ -30,7 +30,7 @@ The current repository version catalog/configuration lists the following baselin
 | Application ID | `com.aistudio.xelvic.krvpmz` |
 | Namespace | `com.example` |
 
-MediaPipe Face Landmarker is **not assumed to be integrated in the baseline**. During R0, select a compatible Tasks Vision dependency and model asset, pin the chosen version, verify Android/ABI support, and record the exact versions in the R&D branch before integrating it.
+The baseline still uses ML Kit and is unchanged. The R&D branch pins `com.google.mediapipe:tasks-vision:1.1.1` and adds `MediaPipeFaceGeometryProvider`; the model asset itself is not committed. Place `face_landmarker.task` in `app/src/main/assets/` using the instructions in that directory. The adapter is isolated and not yet connected to `CameraController` or the renderer.
 
 ## Current Baseline vs. Mesh Engine R&D
 
@@ -524,3 +524,23 @@ No new performance or accuracy result is claimed by this document. Fill this tab
 ---
 
 **Project principle:** first prove geometry and coordinate correctness, then texture mapping, then occlusion, then advanced tracking and device tuning. Persistent tracking and static-resource reuse are requirements from the start; learned dynamic rigidity and other expensive research methods are introduced only when measurements justify them.
+
+
+## R0.2 Implementation Status — Research Branch
+
+Implemented on `research/face-mesh-texture-occlusion`:
+
+- Pinned `com.google.mediapipe:tasks-vision:1.1.1` through the version catalog.
+- Added `FaceGeometrySnapshot`, with defensive copies and validation for image dimensions, rotation, finite coordinates, blendshape scores and 4×4 matrix length.
+- Added the `FaceGeometryProvider` abstraction and explicit result/error listeners.
+- Added `MediaPipeFaceGeometryProvider` using CPU delegate and `LIVE_STREAM` mode. It converts CameraX `YUV_420_888` frames into owned ARGB bitmaps, applies image rotation before inference without mirroring the pixels, enforces monotonic timestamps, and permits one pending inference at a time to bound memory/latency.
+- Added unit tests for snapshot validation and immutability.
+- Added `app/src/main/assets/README.md` with the official model asset location.
+
+Not yet completed or claimed as verified:
+
+- The binary `face_landmarker.task` model must be downloaded to `app/src/main/assets/face_landmarker.task` locally. It is intentionally not included as a source-text file.
+- The new provider is **not yet wired** into the active camera flow; ML Kit remains the runtime provider until a later integration step.
+- The app has not been built/tested against these new commits in the user's Android Studio environment during this change.
+- Device-level image orientation, inference latency, visual coordinate correctness, thermal cost and memory use remain to be measured.
+- Triangle topology and UV coordinates are not supplied/verified by the snapshot adapter. Do not render a mesh texture until the canonical topology and UV layout are pinned to the task/model.
