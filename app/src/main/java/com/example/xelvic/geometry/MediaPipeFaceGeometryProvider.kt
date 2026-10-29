@@ -205,7 +205,7 @@ class MediaPipeFaceGeometryProvider(
                     topologyId = null
                 )
             )
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             notifyError(error)
         } finally {
             frame.release()
@@ -222,7 +222,7 @@ class MediaPipeFaceGeometryProvider(
     private fun notifyResult(snapshot: FaceGeometrySnapshot?) {
         try {
             resultListener.get().invoke(snapshot)
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             Log.e(TAG, "Face geometry result listener threw an exception", error)
         }
     }
@@ -329,7 +329,7 @@ class MediaPipeFaceGeometryProvider(
     private fun closeProxySafely(imageProxy: ImageProxy) {
         try {
             imageProxy.close()
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             Log.w(TAG, "ImageProxy close failed", error)
         }
     }
@@ -339,7 +339,7 @@ class MediaPipeFaceGeometryProvider(
 
         try {
             landmarker.close()
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             Log.w(TAG, "MediaPipe FaceLandmarker close failed", error)
         } finally {
             pendingFrame.getAndSet(null)?.release()
@@ -368,7 +368,7 @@ class MediaPipeFaceGeometryProvider(
             }
             try {
                 if (!bitmap.isRecycled) bitmap.recycle()
-            } catch (_: Throwable) {
+            } catch (_: Exception) {
                 // Best effort cleanup.
             }
         }
