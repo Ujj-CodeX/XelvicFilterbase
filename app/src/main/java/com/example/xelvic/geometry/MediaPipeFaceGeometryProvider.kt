@@ -156,15 +156,13 @@ class MediaPipeFaceGeometryProvider(
         val frame = pendingFrame.get() ?: return
         // A late callback must never consume a newer frame's resources.
         if (result.timestampMs() != frame.timestampMs) {
-            if (pendingFrame.compareAndSet(frame, null)) {
-                frame.release()
-                inferenceInFlight.set(false)
-                notifyError(
-                    IllegalStateException(
-                        "MediaPipe result timestamp mismatch: result=${result.timestampMs()}, pending=${frame.timestampMs}"
-                    )
-                )
-            }
+            // Never release or replace the currently pending frame for a stale callback.
+            // The controller's error fallback closes this provider and releases its own frame.
+            val error = IllegalStateException(
+                "MediaPipe result timestamp mismatch: result=${result.timestampMs()}, pending=${frame.timestampMs}"
+            )
+            Log.w(TAG, "Ignoring stale result callback", error)
+            notifyError(error)
             return
         }
         if (!pendingFrame.compareAndSet(frame, null)) return
