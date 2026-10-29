@@ -138,7 +138,7 @@ class MediaPipeFaceGeometryProvider(
             }
 
             landmarker.detectAsync(frame.mpImage, frame.timestampMs)
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             if (!proxyClosed) closeProxySafely(imageProxy)
             sourceBitmap?.recycle()
             inferenceBitmap?.recycle()
@@ -149,7 +149,13 @@ class MediaPipeFaceGeometryProvider(
     }
 
     private fun handleResult(result: FaceLandmarkerResult) {
-        val frame = pendingFrame.getAndSet(null) ?: return
+        val frame = pendingFrame.get() ?: return
+        // A late callback must never consume a newer frame's resources.
+        if (result.timestampMs() != frame.timestampMs) {
+            Log.w(TAG, "Ignoring stale result timestamp=${result.timestampMs()}, pending=${frame.timestampMs}")
+            return
+        }
+        if (!pendingFrame.compareAndSet(frame, null)) return
 
         try {
             if (closed.get()) return
@@ -188,7 +194,7 @@ class MediaPipeFaceGeometryProvider(
 
             notifyResult(
                 FaceGeometrySnapshot(
-                    timestampMs = result.timestampMs().coerceAtLeast(frame.timestampMs),
+                    timestampMs = frame.timestampMs,
                     imageWidth = frame.imageWidth,
                     imageHeight = frame.imageHeight,
                     rotationDegrees = frame.rotationDegrees,
@@ -225,7 +231,7 @@ class MediaPipeFaceGeometryProvider(
         Log.e(TAG, "Face geometry provider failed", error)
         try {
             errorListener.get()?.invoke(error)
-        } catch (listenerError: Throwable) {
+        } catch (listenerError: Exception) {
             Log.e(TAG, "Face geometry error listener threw an exception", listenerError)
         }
     }
@@ -357,7 +363,7 @@ class MediaPipeFaceGeometryProvider(
 
             try {
                 mpImage.close()
-            } catch (_: Throwable) {
+            } catch (_: Exception) {
                 // Best effort cleanup after inference completes or provider closes.
             }
             try {
