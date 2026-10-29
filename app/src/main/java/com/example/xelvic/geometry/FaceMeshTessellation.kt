@@ -316,8 +316,13 @@ object FaceMeshTessellation {
         309, 459, 289, 305, 339, 448, 286, 441, 250, 309, 290, 305, 288, 361, 249, 390
     )
 
+    /**
+     * Supported Face Landmarker outputs for this topology contract:
+     * legacy 468-point surface-only output, or current 478-point output with 10 iris points.
+     * Do not implicitly opt a future/different model into this topology based on count alone.
+     */
     fun supportsLandmarkCount(landmarkCount: Int): Boolean =
-        landmarkCount >= LANDMARK_COUNT
+        landmarkCount == 468 || landmarkCount == 478
 
     fun triangleVertexIndex(index: Int): Int {
         require(index in 0 until TRIANGLE_INDEX_COUNT)
