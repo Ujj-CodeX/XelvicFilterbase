@@ -20,8 +20,6 @@ import androidx.core.view.doOnAttach
 import androidx.core.view.doOnLayout
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
-import com.example.xelvic.geometry.FaceGeometryProvider
-import com.example.xelvic.geometry.FaceGeometrySnapshot
 import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.geometry.MediaPipeFaceGeometryProvider
 import kotlinx.coroutines.flow.MutableStateFlow
