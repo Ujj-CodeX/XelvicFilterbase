@@ -18,6 +18,7 @@ import java.util.zip.ZipInputStream
 import android.graphics.BitmapFactory
 import org.json.JSONObject
 import java.util.Locale
+import java.security.MessageDigest
 
 
 /**
@@ -435,16 +436,17 @@ class FilterPackageManager(private val context: Context) {
         private const val MAX_LAYERS = 32
         private const val MAX_IMAGE_DIMENSION = 2048
         private const val MAX_IMAGE_PIXELS = 4_194_304L
+        // App-generated provenance file. Imported archives cannot supply entries without an allowed extension.
+        private const val BUNDLED_ORIGIN_MARKER = ".xelvic-bundled-source-sha256"
     }
 
 
     fun installBundledFiltersIfNecessary(): List<InstalledFilter> {
         val assetManager = context.assets
-
         val assetFiles = try {
             assetManager.list("filters") ?: emptyArray()
-        } catch (e: Exception) {
-            Log.e(TAG, "Could not list bundled filters", e)
+        } catch (error: Exception) {
+            Log.e(TAG, "Could not list bundled filters", error)
             return listInstalledFilters()
         }
 
@@ -452,27 +454,120 @@ class FilterPackageManager(private val context: Context) {
             val filterId = filename.removeSuffix(".xfilter")
             val installedDir = File(filtersDirectory, filterId)
 
-            if (installedDir.exists()) continue
-
             try {
-                assetManager.open("filters/$filename").use { inputStream ->
-                    installPackage(inputStream, isBundled = true)
+                val sourceFingerprint = assetManager.open("filters/" + filename).use { sha256(it) }
+
+                if (installedDir.exists()) {
+                    val markerFile = File(installedDir, BUNDLED_ORIGIN_MARKER)
+                    if (markerFile.exists()) {
+                        val installedFingerprint = readBundledSourceFingerprint(installedDir)
+                        if (installedFingerprint == null) {
+                            Log.w(TAG, "Preserving '" + filterId + "': bundled-origin marker is invalid")
+                            continue
+                        }
+                        if (installedFingerprint == sourceFingerprint) continue
+                        // Proven bundled directory: the staged installer below replaces it atomically.
+                    } else {
+                        // Legacy installs had no provenance. Adopt only byte-identical packages;
+                        // never overwrite an unmarked user package that happens to reuse a bundled ID.
+                        if (isInstalledPackageIdenticalToBundled(installedDir, filename, filterId)) {
+                            markerFile.writeText(sourceFingerprint, Charsets.US_ASCII)
+                            Log.i(TAG, "Recovered bundled provenance for identical package: " + filterId)
+                        } else {
+                            Log.w(TAG, "Preserving unmarked installed package '" + filterId + "'; source cannot be proven")
+                        }
+                        continue
+                    }
                 }
 
-                Log.i(TAG, "Successfully installed bundled filter: $filename")
-            } catch (e: Exception) {
-                Log.e(
-                    TAG,
-                    "Failed to install bundled filter '$filename': ${e.message}",
-                    e
-                )
-                System.err.println(
-                    "BUNDLED FILTER FAILURE: $filename\n${e.stackTraceToString()}"
-                )
+                assetManager.open("filters/" + filename).use { inputStream ->
+                    installPackage(inputStream, isBundled = true)
+                }
+                Log.i(TAG, "Successfully installed/reconciled bundled filter: " + filename)
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to install bundled filter '" + filename + "': " + error.message, error)
+                System.err.println("BUNDLED FILTER FAILURE: " + filename + "\n" + error.stackTraceToString())
             }
         }
 
         return listInstalledFilters()
+    }
+
+    private fun sha256(input: InputStream): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(8192)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            if (count > 0) digest.update(buffer, 0, count)
+        }
+        return digest.digest().joinToString("") { byte ->
+            String.format(Locale.ROOT, "%02x", byte.toInt() and 0xff)
+        }
+    }
+
+    private fun sha256(file: File): String =
+        FileInputStream(file).use { sha256(it) }
+
+    private fun readBundledSourceFingerprint(packageDir: File): String? {
+        val marker = File(packageDir, BUNDLED_ORIGIN_MARKER)
+        if (!marker.isFile) return null
+        val fingerprint = try {
+            marker.readText(Charsets.US_ASCII).trim()
+        } catch (_: Exception) {
+            return null
+        }
+        return fingerprint.takeIf { value ->
+            value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' }
+        }
+    }
+
+    private fun isInstalledPackageIdenticalToBundled(
+        installedDir: File,
+        filename: String,
+        expectedFilterId: String
+    ): Boolean {
+        val comparisonDir = File(
+            filtersDirectory,
+            ".tmp_bundle_verify_" + System.currentTimeMillis() + "_" + (1000..9999).random()
+        )
+        if (!comparisonDir.mkdirs()) return false
+
+        return try {
+            context.assets.open("filters/" + filename).use { archive ->
+                extractArchiveSafely(archive, comparisonDir)
+            }
+            val manifestFile = File(comparisonDir, "manifest.json")
+            if (!manifestFile.isFile) return false
+            val manifest = manifestFile.readText(Charsets.UTF_8)
+            validateManifestDocument(manifest)
+            val definition = FilterDefinition.fromJson(manifest)
+            if (definition.id != expectedFilterId) return false
+            validatePackageAssets(comparisonDir, definition)
+            directoriesHaveSamePackageFiles(installedDir, comparisonDir)
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not prove legacy bundled provenance for '" + expectedFilterId + "'", error)
+            false
+        } finally {
+            if (comparisonDir.exists()) deleteRecursively(comparisonDir)
+        }
+    }
+
+    private fun directoriesHaveSamePackageFiles(first: File, second: File): Boolean {
+        fun filesByRelativePath(root: File): Map<String, File> =
+            root.walkTopDown()
+                .filter { it.isFile }
+                .associateBy { it.relativeTo(root).invariantSeparatorsPath }
+
+        val firstFiles = filesByRelativePath(first)
+        val secondFiles = filesByRelativePath(second)
+        if (firstFiles.keys != secondFiles.keys) return false
+
+        return firstFiles.all { (relativePath, firstFile) ->
+            val secondFile = secondFiles[relativePath] ?: return@all false
+            firstFile.length() == secondFile.length() &&
+                sha256(firstFile) == sha256(secondFile)
+        }
     }
 
     /**
@@ -581,6 +676,15 @@ class FilterPackageManager(private val context: Context) {
                         "FACE_MESH_TEXTURE packages are not installable yet except for the exact bundled debug moustache fixture; imported packages require a verified model-pinned UV layout"
                     )
                 }
+            }
+
+            // The marker is generated by the app after package validation and cannot be supplied
+            // by an imported archive (the ZIP extractor rejects entries without an allowed extension).
+            if (isBundled) {
+                File(tempDir, BUNDLED_ORIGIN_MARKER).writeText(
+                    sha256(archiveFile),
+                    Charsets.US_ASCII
+                )
             }
 
             // 5. Stage the existing installation as a rollback backup.
@@ -705,7 +809,7 @@ class FilterPackageManager(private val context: Context) {
                             definition = definition,
                             packageDirectory = dir,
                             thumbnailFile = thumbnail,
-                            isBundled = false
+                            isBundled = readBundledSourceFingerprint(dir) != null
                         )
                     )
                 }

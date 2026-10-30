@@ -7,6 +7,7 @@ import com.example.xelvic.packagemanager.FilterPackageManager
 import com.example.xelvic.model.FilterRenderer
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -104,6 +105,66 @@ class FilterPackageManagerHardeningTest {
         assertEquals("diagnostic_face_space_v1", moustache.definition.meshTexture?.uvLayout)
         assertTrue(File(moustache.packageDirectory, "assets/moustache.png").isFile)
         assertTrue(moustache.thumbnailFile.isFile)
+        assertTrue(moustache.isBundled)
+    }
+
+    @Test
+    fun bundledSourceFingerprintReconcilesKnownStaleBundleAndSurvivesReload() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = FilterPackageManager(context)
+        manager.removeFilter("moustache_mesh_test")
+
+        manager.installBundledFiltersIfNecessary()
+        val first = manager.listInstalledFilters().first { it.id == "moustache_mesh_test" }
+        assertTrue(first.isBundled)
+
+        val marker = File(first.packageDirectory, ".xelvic-bundled-source-sha256")
+        assertTrue(marker.isFile)
+        marker.writeText("0".repeat(64), Charsets.US_ASCII)
+
+        manager.installBundledFiltersIfNecessary()
+        val refreshed = manager.listInstalledFilters().first { it.id == "moustache_mesh_test" }
+        assertTrue(refreshed.isBundled)
+        assertTrue(marker.readText(Charsets.US_ASCII).trim() != "0".repeat(64))
+    }
+
+    @Test
+    fun bundledReconciliationDoesNotOverwriteUnmarkedUserPackageWithSameId() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = prepareManager(context)
+        val entries = readBundledPackage(context, "cat_face.xfilter")
+        val manifest = JSONObject(entries.getValue("manifest.json").toString(Charsets.UTF_8))
+            .put("name", "User Customized Cat")
+            .put("version", "9.0.0")
+        entries["manifest.json"] = manifest.toString().toByteArray(Charsets.UTF_8)
+
+        val userPackage = manager.installPackage(
+            ByteArrayInputStream(buildArchive(entries)),
+            isBundled = false
+        )
+        assertFalse(userPackage.isBundled)
+
+        manager.installBundledFiltersIfNecessary()
+        val reloaded = manager.listInstalledFilters().first { it.id == "cat_face" }
+        assertEquals("User Customized Cat", reloaded.definition.name)
+        assertFalse(reloaded.isBundled)
+    }
+
+    @Test
+    fun identicalLegacyBundledPackageCanRecoverItsProvenance() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = FilterPackageManager(context)
+        manager.removeFilter("cat_face")
+        val legacyPackage = manager.installPackage(
+            ByteArrayInputStream(buildArchive(readBundledPackage(context, "cat_face.xfilter"))),
+            isBundled = false
+        )
+        assertFalse(legacyPackage.isBundled)
+
+        manager.installBundledFiltersIfNecessary()
+        val reloaded = manager.listInstalledFilters().first { it.id == "cat_face" }
+        assertTrue(reloaded.isBundled)
+        assertTrue(File(reloaded.packageDirectory, ".xelvic-bundled-source-sha256").isFile)
     }
 
     @Test
