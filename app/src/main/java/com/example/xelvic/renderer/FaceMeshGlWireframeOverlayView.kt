@@ -61,8 +61,10 @@ class FaceMeshGlWireframeOverlayView @JvmOverloads constructor(
         glRenderer.publishFrame(next?.getLatest())
         if (next != null) {
             listenerHandle = next.addSnapshotListener {
-                glRenderer.publishFrame(next.getLatest())
-                requestRender()
+                if (attachedHolder === next) {
+                    glRenderer.publishFrame(next.getLatest())
+                    requestRender()
+                }
             }
         }
         requestRender()
@@ -70,6 +72,8 @@ class FaceMeshGlWireframeOverlayView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         setSnapshotHolder(null)
+        glRenderer.setEnabled(false)
+        requestRender()
         super.onDetachedFromWindow()
     }
 }

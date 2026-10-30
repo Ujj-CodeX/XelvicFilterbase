@@ -47,7 +47,16 @@ internal fun FaceMeshTextureOverlay(
             view.setSnapshotHolder(if (enabled) holder else null)
             view.setEffect(if (enabled) effect else null)
         },
-        modifier = modifier
+        modifier = modifier,
+        onRelease = { view ->
+            view.setDiagnosticsListener(null)
+            view.setSnapshotHolder(null)
+            view.setEffect(null)
+            view.onPause()
+            if (viewRef[0] === view) {
+                viewRef[0] = null
+            }
+        }
     )
 
     DisposableEffect(lifecycleOwner) {
@@ -67,7 +76,6 @@ internal fun FaceMeshTextureOverlay(
             viewRef[0]?.setSnapshotHolder(null)
             viewRef[0]?.setEffect(null)
             viewRef[0]?.onPause()
-            viewRef[0] = null
         }
     }
 }

@@ -46,7 +46,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -135,12 +134,16 @@ fun CameraScreen(
             FaceMeshEffectResolution.NoSelection
         )
     }
+    var resolvedMeshFilterIdentity by remember { mutableStateOf<String?>(null) }
 
+    val selectedFilterIdentity = selectedFilter?.let { filter ->
+        "${filter.id}:${filter.definition.version}"
+    }
     val isMeshTextureSelected =
         selectedFilter?.definition?.renderer == FilterRenderer.FACE_MESH_TEXTURE
 
     // Mesh filters own the MediaPipe geometry session; Canvas filters return to ML Kit.
-    LaunchedEffect(selectedFilter?.id, isMeshTextureSelected) {
+    LaunchedEffect(selectedFilterIdentity, isMeshTextureSelected) {
         val geometryEnabled = cameraController.isMediaPipeGeometryEnabled.value
         when {
             isMeshTextureSelected && !geometryEnabled ->
@@ -151,7 +154,7 @@ fun CameraScreen(
     }
 
     LaunchedEffect(
-        selectedFilter?.id,
+        selectedFilterIdentity,
         isMeshTextureSelected,
         isMediaPipeGeometryEnabled,
         isMediaPipeFaceTracked
@@ -160,11 +163,19 @@ fun CameraScreen(
             .getLatest()
             ?.snapshot
             ?.modelAssetSha256
+        val readyForCurrentSelection =
+            resolvedMeshFilterIdentity == selectedFilterIdentity &&
+                meshEffectResolution is FaceMeshEffectResolution.Ready
 
-        meshEffectResolution = meshEffectResolver.resolve(
-            filter = selectedFilter,
-            activeModelAssetSha256 = activeModelSha256
-        )
+        // Preserve an already validated effect while tracking is temporarily lost. Re-resolve
+        // when a model identity is available or the selected filter/mode actually changed.
+        if (activeModelSha256 != null || !isMeshTextureSelected || !readyForCurrentSelection) {
+            meshEffectResolution = meshEffectResolver.resolve(
+                filter = selectedFilter,
+                activeModelAssetSha256 = activeModelSha256
+            )
+            resolvedMeshFilterIdentity = selectedFilterIdentity
+        }
     }
 
     val activeMeshEffect =

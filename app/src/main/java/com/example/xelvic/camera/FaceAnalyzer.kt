@@ -13,6 +13,7 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.camera.view.TransformExperimental
@@ -73,6 +74,7 @@ class FaceAnalyzer(
 
     // Guard preventing overlapping ML Kit inference Tasks
     private val isAnalyzing = AtomicBoolean(false)
+    private val analysisSessionGeneration = AtomicLong(0L)
 
     @Volatile
     private var lastHasTrackedFace: Boolean = false
@@ -89,6 +91,8 @@ class FaceAnalyzer(
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
+        val frameSessionGeneration = analysisSessionGeneration.get()
+
         // Record current analysis resolution for telemetry
         if (performanceMonitor.analysisResolution.width == 0) {
             performanceMonitor.analysisResolution = Size(imageProxy.width, imageProxy.height)
@@ -117,12 +121,9 @@ class FaceAnalyzer(
         }
 
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-
-
         val cameraCoordinateTransform = createCoordinateTransform(imageProxy)
-
-
         val frameTimestampMs = imageProxy.imageInfo.timestamp / 1_000_000L
+        val frameIsFrontCamera = isFrontCamera
         val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
         val startTime = SystemClock.elapsedRealtime()
 
@@ -130,6 +131,10 @@ class FaceAnalyzer(
             .addOnSuccessListener { faces ->
                 val durationMs = SystemClock.elapsedRealtime() - startTime
                 performanceMonitor.recordInference(durationMs, frameTimestampMs)
+
+                if (analysisSessionGeneration.get() != frameSessionGeneration) {
+                    return@addOnSuccessListener
+                }
 
                 if (faces.isNotEmpty()) {
                     lastHasTrackedFace = true
@@ -142,7 +147,7 @@ class FaceAnalyzer(
                         rotationDegrees = rotationDegrees,
                         previewWidth = previewWidth,
                         previewHeight = previewHeight,
-                        isFrontCamera = isFrontCamera,
+                        isFrontCamera = frameIsFrontCamera,
                         sourceTimestampMs = frameTimestampMs,
                         coordinateTransform = cameraCoordinateTransform
                     )
@@ -153,8 +158,10 @@ class FaceAnalyzer(
                 }
             }
             .addOnFailureListener {
-                lastHasTrackedFace = false
-                onFaceTracked(FaceTrackingResult.EMPTY)
+                if (analysisSessionGeneration.get() == frameSessionGeneration) {
+                    lastHasTrackedFace = false
+                    onFaceTracked(FaceTrackingResult.EMPTY)
+                }
             }
             .addOnCompleteListener {
                 isAnalyzing.set(false)
@@ -188,6 +195,14 @@ class FaceAnalyzer(
 
             null
         }
+    }
+
+    /** Rejects an in-flight result that belongs to a stopped or replaced preview surface. */
+    fun invalidatePendingAnalysis() {
+        analysisSessionGeneration.incrementAndGet()
+        transformWarningLogged.set(false)
+        lastHasTrackedFace = false
+        onFaceTracked(FaceTrackingResult.EMPTY)
     }
 
     fun release() {

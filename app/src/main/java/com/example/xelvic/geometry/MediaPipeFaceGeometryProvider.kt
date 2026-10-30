@@ -37,6 +37,8 @@ class MediaPipeFaceGeometryProvider(
     private val inferenceInFlight = AtomicBoolean(false)
     private val lastTimestampMs = AtomicLong(-1L)
     private val pendingFrame = AtomicReference<PendingFrame?>(null)
+    private val resultGenerationLock = Any()
+    private var resultGeneration = 0L
     private val resultListener = AtomicReference<(FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit>({ _, _ -> })
     private val errorListener = AtomicReference<((Throwable) -> Unit)?>(null)
 
@@ -79,6 +81,16 @@ class MediaPipeFaceGeometryProvider(
         errorListener.set(listener)
     }
 
+    /**
+     * Retires the result currently in flight without closing the persistent tracker. The inference
+     * may finish normally, but geometry captured for an old PreviewView/camera session is dropped.
+     */
+    fun invalidatePendingFrames() {
+        synchronized(resultGenerationLock) {
+            resultGeneration++
+        }
+    }
+
     override fun submitFrame(
         imageProxy: ImageProxy,
         timestampMs: Long,
@@ -97,6 +109,8 @@ class MediaPipeFaceGeometryProvider(
             return
         }
 
+        val frameResultGeneration =
+            synchronized(resultGenerationLock) { resultGeneration }
         var proxyClosed = false
         var sourceBitmap: Bitmap? = null
         var inferenceBitmap: Bitmap? = null
@@ -124,6 +138,7 @@ class MediaPipeFaceGeometryProvider(
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
             val frame = PendingFrame(
                 timestampMs = timestamp,
+                resultGeneration = frameResultGeneration,
                 imageWidth = rotatedBitmap.width,
                 imageHeight = rotatedBitmap.height,
                 rotationDegrees = rotationDegrees,
@@ -134,20 +149,23 @@ class MediaPipeFaceGeometryProvider(
             )
             inferenceBitmap = null // ownership transferred to PendingFrame
 
-            pendingFrame.set(frame)
-            if (closed.get()) {
-                pendingFrame.getAndSet(null)?.release()
-                inferenceInFlight.set(false)
-                return
+            synchronized(resultGenerationLock) {
+                if (frameResultGeneration != resultGeneration || closed.get()) {
+                    frame.release()
+                    inferenceInFlight.set(false)
+                    return
+                }
+                pendingFrame.set(frame)
+                landmarker.detectAsync(frame.mpImage, frame.timestampMs)
             }
-
-            landmarker.detectAsync(frame.mpImage, frame.timestampMs)
         } catch (error: Exception) {
             sourceBitmap?.recycle()
             inferenceBitmap?.recycle()
             pendingFrame.getAndSet(null)?.release()
             inferenceInFlight.set(false)
-            notifyError(error)
+            if (isResultGenerationCurrent(frameResultGeneration)) {
+                notifyError(error)
+            }
         } finally {
             if (!proxyClosed) {
                 proxyClosed = true
@@ -166,7 +184,9 @@ class MediaPipeFaceGeometryProvider(
                 "MediaPipe result timestamp mismatch: result=${result.timestampMs()}, pending=${frame.timestampMs}"
             )
             Log.w(TAG, "Ignoring stale result callback", error)
-            notifyError(error)
+            if (isResultGenerationCurrent(frame.resultGeneration)) {
+                notifyError(error)
+            }
             return
         }
         if (!pendingFrame.compareAndSet(frame, null)) return
@@ -176,7 +196,7 @@ class MediaPipeFaceGeometryProvider(
 
             val faceLandmarks = result.faceLandmarks().firstOrNull()
             if (faceLandmarks.isNullOrEmpty()) {
-                notifyResult(null, frame.displayTransform)
+                notifyResultIfCurrent(frame, null)
                 return
             }
 
@@ -206,7 +226,8 @@ class MediaPipeFaceGeometryProvider(
                 .firstOrNull()
                 ?.toList()
 
-            notifyResult(
+            notifyResultIfCurrent(
+                frame,
                 FaceGeometrySnapshot(
                     timestampMs = frame.timestampMs,
                     imageWidth = frame.imageWidth,
@@ -224,11 +245,12 @@ class MediaPipeFaceGeometryProvider(
                         null
                     },
                     modelAssetSha256 = modelAssetSha256
-                ),
-                frame.displayTransform
+                )
             )
         } catch (error: Exception) {
-            notifyError(error)
+            if (isResultGenerationCurrent(frame.resultGeneration)) {
+                notifyError(error)
+            }
         } finally {
             frame.release()
             inferenceInFlight.set(false)
@@ -236,21 +258,31 @@ class MediaPipeFaceGeometryProvider(
     }
 
     private fun handleError(error: RuntimeException) {
-        pendingFrame.getAndSet(null)?.release()
+        val frame = pendingFrame.getAndSet(null)
+        frame?.release()
         inferenceInFlight.set(false)
-        notifyError(error)
+        if (frame == null || isResultGenerationCurrent(frame.resultGeneration)) {
+            notifyError(error)
+        }
     }
 
-    private fun notifyResult(
-        snapshot: FaceGeometrySnapshot?,
-        displayTransform: FaceGeometryDisplayTransform?
+    private fun notifyResultIfCurrent(
+        frame: PendingFrame,
+        snapshot: FaceGeometrySnapshot?
     ) {
+        val listener = synchronized(resultGenerationLock) {
+            if (closed.get() || frame.resultGeneration != resultGeneration) return
+            resultListener.get()
+        }
         try {
-            resultListener.get().invoke(snapshot, displayTransform)
+            listener.invoke(snapshot, frame.displayTransform)
         } catch (error: Exception) {
             Log.e(TAG, "Face geometry result listener threw an exception", error)
         }
     }
+
+    private fun isResultGenerationCurrent(generation: Long): Boolean =
+        synchronized(resultGenerationLock) { generation == resultGeneration }
 
     private fun notifyError(error: Throwable) {
         Log.e(TAG, "Face geometry provider failed", error)
@@ -393,6 +425,7 @@ class MediaPipeFaceGeometryProvider(
 
     private class PendingFrame(
         val timestampMs: Long,
+        val resultGeneration: Long,
         val imageWidth: Int,
         val imageHeight: Int,
         val rotationDegrees: Int,

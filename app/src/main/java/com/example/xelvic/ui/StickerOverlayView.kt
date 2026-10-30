@@ -24,13 +24,36 @@ import com.example.xelvic.renderer.StickerRenderer
  */
 class TrackingOverlayView(context: Context) : View(context) {
 
+    private val poseUpdateListener: () -> Unit = { postInvalidateOnAnimation() }
+
     var poseHolder: TrackingPoseHolder? = null
         set(value) {
+            if (field === value) return
+            field?.let { previous ->
+                if (previous.onPoseUpdated === poseUpdateListener) {
+                    previous.onPoseUpdated = null
+                }
+            }
             field = value
-            value?.onPoseUpdated = {
-                postInvalidateOnAnimation()
+            if (isAttachedToWindow) {
+                value?.onPoseUpdated = poseUpdateListener
+            }
+            invalidate()
+        }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        poseHolder?.onPoseUpdated = poseUpdateListener
+    }
+
+    override fun onDetachedFromWindow() {
+        poseHolder?.let { holder ->
+            if (holder.onPoseUpdated === poseUpdateListener) {
+                holder.onPoseUpdated = null
             }
         }
+        super.onDetachedFromWindow()
+    }
 
     var selectedFilter: InstalledFilter? = null
     var showDebugOverlay: Boolean = false
@@ -226,6 +249,12 @@ fun StickerOverlayView(
         },
         modifier = modifier
             .fillMaxSize()
-            .testTag("sticker_overlay_canvas")
+            .testTag("sticker_overlay_canvas"),
+        onRelease = { view ->
+            view.poseHolder = null
+            view.selectedFilter = null
+            view.renderer = null
+            view.performanceMonitor = null
+        }
     )
 }

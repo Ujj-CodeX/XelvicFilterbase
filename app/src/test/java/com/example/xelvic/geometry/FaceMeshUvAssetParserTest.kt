@@ -1,5 +1,7 @@
 package com.example.xelvic.geometry
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -61,6 +63,30 @@ class FaceMeshUvAssetParserTest {
         assertNull(result.validationFailure)
         assertEquals(layoutId, result.uvMap!!.uvLayoutId)
         assertEquals(FaceMeshTessellation.LANDMARK_COUNT, result.uvMap.vertexCount)
+    }
+
+    @Test
+    fun productionRegistryAcceptsBundledCanonicalLayout() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val activeModelSha = context.assets.open("face_landmarker.task").use { input ->
+            sha256(input.readBytes())
+        }
+
+        val result = AppFaceMeshUvLayouts.createRegistry(context.assets).load(
+            AppFaceMeshUvLayouts.CANONICAL_MEDIAPIPE_FACE_468,
+            activeModelSha
+        )
+
+        assertTrue(result.isValid)
+        assertNull(result.assetFailure)
+        assertNull(result.validationFailure)
+        assertEquals(FaceMeshTessellation.TOPOLOGY_ID, result.uvMap!!.topologyId)
+        assertEquals(FaceMeshTessellation.LANDMARK_COUNT, result.uvMap.vertexCount)
+        assertEquals(activeModelSha, result.uvMap.modelAssetSha256)
+        assertEquals(
+            "0ed252df853d7be48694dbaa58892c47769cb4d1d881a3d2785acb12d2437b52",
+            result.uvMap.uvAssetSha256
+        )
     }
 
     @Test

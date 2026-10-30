@@ -55,6 +55,11 @@ fun FaceMeshGlWireframeOverlay(
             view.setOverlayEnabled(enabled)
             view.setSnapshotHolder(if (enabled) holder else null)
         },
-        modifier = modifier.testTag("face_mesh_gl_wireframe_overlay")
+        modifier = modifier.testTag("face_mesh_gl_wireframe_overlay"),
+        onRelease = { view ->
+            view.setSnapshotHolder(null)
+            view.setOverlayEnabled(false)
+            view.onPause()
+        }
     )
 }

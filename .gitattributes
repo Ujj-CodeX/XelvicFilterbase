@@ -1,0 +1,2 @@
+# Fingerprinted app-owned assets must retain repository byte identity on every platform.
+app/src/main/assets/uv/mediapipe_task_face_468_canonical_v1.json text eol=lf

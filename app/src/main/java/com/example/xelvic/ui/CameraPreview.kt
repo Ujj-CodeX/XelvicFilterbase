@@ -62,7 +62,10 @@ fun CameraPreview(
                 cameraController.faceAnalyzer.previewWidth = size.width
                 cameraController.faceAnalyzer.previewHeight = size.height
                 onSizeChanged?.invoke(size.width, size.height)
-            }
+            },
+        onRelease = { previewView ->
+            cameraController.unbindCamera(previewView)
+        }
     )
 }
 

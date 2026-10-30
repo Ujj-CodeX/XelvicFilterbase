@@ -73,6 +73,11 @@ class FaceGeometryDebugOverlayView(context: Context) : View(context) {
     private var pointCoordinates = FloatArray(0)
     private var lineCoordinates = FloatArray(0)
 
+    override fun onDetachedFromWindow() {
+        snapshotHolder = null
+        super.onDetachedFromWindow()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!geometryDebugEnabled) return
@@ -211,6 +216,10 @@ fun FaceGeometryDebugOverlay(
             view.snapshotHolder = if (enabled) holder else null
             view.geometryDebugEnabled = enabled
         },
-        modifier = modifier.testTag("face_geometry_debug_overlay")
+        modifier = modifier.testTag("face_geometry_debug_overlay"),
+        onRelease = { view ->
+            view.snapshotHolder = null
+            view.geometryDebugEnabled = false
+        }
     )
 }

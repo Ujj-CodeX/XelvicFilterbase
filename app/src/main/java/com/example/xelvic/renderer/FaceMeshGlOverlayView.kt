@@ -43,6 +43,7 @@ enum class FaceMeshGlRenderStatus {
 
 internal const val DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID = "diagnostic_face_space_v1"
 internal const val DIAGNOSTIC_MOUSTACHE_FILTER_ID = "moustache_mesh_test"
+private const val FACE_MESH_MAX_FRAME_AGE_MS = 250L
 
 /**
  * Immutable render input. The caller retains Bitmap ownership and must keep it alive and
@@ -111,13 +112,19 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
 
         if (next != null) {
             snapshotListenerHandle = next.addSnapshotListener {
-                publishFrame(next.getLatest())
+                if (attachedHolder === next) {
+                    publishFrame(next.getLatest())
+                }
             }
         }
     }
 
     override fun onDetachedFromWindow() {
         setSnapshotHolder(null)
+        setEffect(null)
+        setDiagnosticsListener(null)
+        // Ensure GL-owned texture deletion runs before GLSurfaceView stops its render thread.
+        requestRender()
         super.onDetachedFromWindow()
     }
 
@@ -136,6 +143,23 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
     fun publishFrame(frame: FaceGeometryRenderFrame?) {
         meshRenderer.publishFrame(frame)
         requestRender()
+        if (frame != null) {
+            scheduleStaleFrameClear(frame.snapshot.timestampMs)
+        }
+    }
+
+    private fun scheduleStaleFrameClear(frameTimestampMs: Long) {
+        postDelayed(
+            {
+                if (
+                    isAttachedToWindow &&
+                    meshRenderer.isCurrentFrame(frameTimestampMs)
+                ) {
+                    requestRender()
+                }
+            },
+            FACE_MESH_MAX_FRAME_AGE_MS + STALE_FRAME_CLEAR_GRACE_MS
+        )
     }
 
     /** Select or clear an effect without recreating the tracking provider. */
@@ -155,6 +179,10 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
         listener: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?
     ) {
         meshRenderer.setDiagnosticsListener(listener)
+    }
+
+    private companion object {
+        const val STALE_FRAME_CLEAR_GRACE_MS = 16L
     }
 }
 
@@ -223,6 +251,9 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         latestFrame.set(frame)
     }
 
+    fun isCurrentFrame(timestampMs: Long): Boolean =
+        latestFrame.get()?.snapshot?.timestampMs == timestampMs
+
     fun setEffect(effect: FaceMeshGlEffect?) {
         selectedEffect.set(effect)
     }
@@ -282,7 +313,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         if (effect == null) {
             releaseTexture()
             attemptedEffect = null
-            uploadedEffect = null
+            latestFrame.set(null)
             lastDecision = RenderBackendDecision(
                 RenderBackend.UNAVAILABLE,
                 RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING
@@ -316,6 +347,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         }
         val frameAgeMs = SystemClock.uptimeMillis() - frame.snapshot.timestampMs
         if (frameAgeMs < 0L || frameAgeMs > MAX_FRAME_AGE_MS) {
+            latestFrame.compareAndSet(frame, null)
             publishRenderStatus(FaceMeshGlRenderStatus.STALE_FRAME)
             return
         }
@@ -437,6 +469,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
             textureId = 0
         }
+        uploadedEffect = null
     }
 
     private fun blocked(reason: RenderBackendBlockReason) =
@@ -498,7 +531,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
 
     private companion object {
         const val TAG = "FaceMeshGlOverlay"
-        const val MAX_FRAME_AGE_MS = 250L
+        const val MAX_FRAME_AGE_MS = FACE_MESH_MAX_FRAME_AGE_MS
 
         val VERTEX_SHADER =
             "attribute vec2 aPosition;\n" +
