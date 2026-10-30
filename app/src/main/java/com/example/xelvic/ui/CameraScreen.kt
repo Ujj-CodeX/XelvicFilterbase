@@ -76,6 +76,7 @@ import com.example.xelvic.model.InstalledFilter
 import com.example.xelvic.renderer.StickerRenderer
 import androidx.camera.view.TransformExperimental
 import com.example.xelvic.geometry.FaceMeshUvRegistry
+import com.example.xelvic.geometry.PinnedFaceMeshUvLayout
 import com.example.xelvic.model.FilterRenderer
 import com.example.xelvic.renderer.FaceMeshEffectBlockReason
 import com.example.xelvic.renderer.FaceMeshEffectResolution
@@ -106,8 +107,16 @@ fun CameraScreen(
     val isMediaPipeFaceTracked by cameraController.isMediaPipeFaceTracked.collectAsState()
 
     val uvRegistry = remember(context) {
-        // Intentionally empty until a model-compatible UV layout is verified.
-        FaceMeshUvRegistry(context.assets, emptyList())
+        FaceMeshUvRegistry(
+            context.assets,
+            listOf(
+                PinnedFaceMeshUvLayout(
+                    layoutId = "mediapipe_task_face_468_canonical_v1",
+                    assetPath = "uv/mediapipe_task_face_468_canonical_v1.json",
+                    expectedSha256 = "7263a84a2bf5f023abd5561e5727397ae94422a09566eebbf438c97c5d3b0d61"
+                )
+            )
+        )
     }
 
     val meshEffectResolver = remember(uvRegistry) {
