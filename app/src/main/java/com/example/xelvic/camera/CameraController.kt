@@ -42,6 +42,34 @@ enum class FlashMode {
     ON,
     AUTO
 }
+
+enum class CameraPreviewStreamStatus {
+    UNKNOWN,
+    IDLE,
+    STREAMING
+}
+
+enum class GeometryDisplayTransformStatus {
+    DISABLED,
+    WAITING_FOR_PREVIEW,
+    WAITING_FOR_OUTPUT_TRANSFORM,
+    READY,
+    FAILED
+}
+
+/** Snapshot of CameraX preview and MediaPipe display-transform readiness for diagnostics. */
+data class CameraPreviewDiagnostics(
+    val previewStreamStatus: CameraPreviewStreamStatus = CameraPreviewStreamStatus.UNKNOWN,
+    val previewViewAttached: Boolean = false,
+    val previewWidth: Int = 0,
+    val previewHeight: Int = 0,
+    val viewPortAvailable: Boolean = false,
+    val useCasesBound: Boolean = false,
+    val outputTransformAvailable: Boolean = false,
+    val geometryTransformStatus: GeometryDisplayTransformStatus =
+        GeometryDisplayTransformStatus.DISABLED,
+    val lastTransformFailure: String? = null
+)
 @TransformExperimental
 class CameraController(
     private val context: Context,
@@ -116,6 +144,19 @@ class CameraController(
     val isCameraReady: StateFlow<Boolean> =
         _isCameraReady.asStateFlow()
 
+    private val diagnosticsLock = Any()
+    private val _previewDiagnostics = MutableStateFlow(CameraPreviewDiagnostics())
+    val previewDiagnostics: StateFlow<CameraPreviewDiagnostics> =
+        _previewDiagnostics.asStateFlow()
+
+    private fun updatePreviewDiagnostics(
+        update: (CameraPreviewDiagnostics) -> CameraPreviewDiagnostics
+    ) {
+        synchronized(diagnosticsLock) {
+            _previewDiagnostics.value = update(_previewDiagnostics.value)
+        }
+    }
+
     private val _cameraError = MutableStateFlow<String?>(null)
     val cameraError: StateFlow<String?> =
         _cameraError.asStateFlow()
@@ -154,6 +195,23 @@ class CameraController(
         val outputTransform = view.outputTransform
         cachedGeometryPreviewTransform = outputTransform
         faceAnalyzer.updatePreviewOutputTransform(outputTransform)
+        updatePreviewDiagnostics { current ->
+            current.copy(
+                previewViewAttached = view.isAttachedToWindow,
+                previewWidth = view.width,
+                previewHeight = view.height,
+                viewPortAvailable = view.viewPort != null,
+                outputTransformAvailable = outputTransform != null,
+                geometryTransformStatus = when {
+                    !geometryRequested -> GeometryDisplayTransformStatus.DISABLED
+                    outputTransform != null -> GeometryDisplayTransformStatus.READY
+                    current.previewStreamStatus == CameraPreviewStreamStatus.STREAMING ->
+                        GeometryDisplayTransformStatus.WAITING_FOR_OUTPUT_TRANSFORM
+                    else -> GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
+                },
+                lastTransformFailure = if (outputTransform != null) null else current.lastTransformFailure
+            )
+        }
     }
 
     /**
@@ -180,6 +238,28 @@ class CameraController(
         }
 
         observedPreviewView = view
+        updatePreviewDiagnostics { current ->
+            val streamStatus = when (view.previewStreamState.value) {
+                PreviewView.StreamState.STREAMING -> CameraPreviewStreamStatus.STREAMING
+                PreviewView.StreamState.IDLE -> CameraPreviewStreamStatus.IDLE
+                else -> CameraPreviewStreamStatus.UNKNOWN
+            }
+            current.copy(
+                previewStreamStatus = streamStatus,
+                previewViewAttached = view.isAttachedToWindow,
+                previewWidth = view.width,
+                previewHeight = view.height,
+                viewPortAvailable = view.viewPort != null,
+                useCasesBound = false,
+                outputTransformAvailable = false,
+                geometryTransformStatus = if (geometryRequested) {
+                    GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
+                } else {
+                    GeometryDisplayTransformStatus.DISABLED
+                },
+                lastTransformFailure = null
+            )
+        }
 
         val layoutListener = View.OnLayoutChangeListener {
                 _, _, _, _, _, _, _, _, _ ->
@@ -194,13 +274,26 @@ class CameraController(
             Observer<PreviewView.StreamState> { state ->
 
                 if (state == PreviewView.StreamState.STREAMING) {
+                    updatePreviewDiagnostics { current ->
+                        current.copy(previewStreamStatus = CameraPreviewStreamStatus.STREAMING)
+                    }
 
                     // Run on the UI thread after the preview starts.
                     view.post {
                         cachePreviewTransform(view)
                     }
-
                 } else {
+                    updatePreviewDiagnostics { current ->
+                        current.copy(
+                            previewStreamStatus = CameraPreviewStreamStatus.IDLE,
+                            outputTransformAvailable = false,
+                            geometryTransformStatus = if (geometryRequested) {
+                                GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
+                            } else {
+                                GeometryDisplayTransformStatus.DISABLED
+                            }
+                        )
+                    }
 
                     // Invalidate stale transform when preview stops.
                     view.post {
@@ -230,6 +323,14 @@ class CameraController(
      */
     fun bindCamera(previewView: PreviewView) {
         currentPreviewView = previewView
+        updatePreviewDiagnostics { current ->
+            current.copy(
+                previewViewAttached = previewView.isAttachedToWindow,
+                previewWidth = previewView.width,
+                previewHeight = previewView.height,
+                viewPortAvailable = previewView.viewPort != null
+            )
+        }
 
         // Keep the reference if other existing code depends on it.
         faceAnalyzer.previewView = previewView
@@ -288,6 +389,7 @@ class CameraController(
         val viewPort = previewView.viewPort
 
         if (viewPort == null) {
+            updatePreviewDiagnostics { it.copy(viewPortAvailable = false) }
             _isCameraReady.value = false
             _cameraError.value =
                 "Camera preview geometry is not ready"
@@ -301,6 +403,9 @@ class CameraController(
         }
 
         try {
+            updatePreviewDiagnostics {
+                it.copy(viewPortAvailable = true, useCasesBound = false)
+            }
             provider.unbindAll()
 
             val lensFacing =
@@ -315,6 +420,7 @@ class CameraController(
                 .build()
 
             if (!provider.hasCamera(selector)) {
+                updatePreviewDiagnostics { it.copy(useCasesBound = false) }
                 _isCameraReady.value = false
                 _cameraError.value =
                     "Requested camera sensor is not available on this device"
@@ -397,6 +503,15 @@ class CameraController(
 
             _isCameraReady.value = true
             _cameraError.value = null
+            updatePreviewDiagnostics {
+                it.copy(
+                    previewViewAttached = previewView.isAttachedToWindow,
+                    previewWidth = previewView.width,
+                    previewHeight = previewView.height,
+                    viewPortAvailable = true,
+                    useCasesBound = true
+                )
+            }
 
             // Refresh after use cases are bound.
             viewRefresh(previewView)
@@ -406,6 +521,7 @@ class CameraController(
         } catch (e: Exception) {
             Log.e(TAG, "Use cases binding failed", e)
 
+            updatePreviewDiagnostics { it.copy(useCasesBound = false) }
             _isCameraReady.value = false
             _cameraError.value =
                 "Camera initialization failed: ${e.message}"
@@ -420,7 +536,22 @@ class CameraController(
     private fun computeGeometryDisplayTransform(
         imageProxy: ImageProxy
     ): FaceGeometryDisplayTransform? {
-        val targetTransform = cachedGeometryPreviewTransform ?: return null
+        val targetTransform = cachedGeometryPreviewTransform
+        if (targetTransform == null) {
+            updatePreviewDiagnostics { current ->
+                current.copy(
+                    outputTransformAvailable = false,
+                    geometryTransformStatus = if (
+                        current.previewStreamStatus == CameraPreviewStreamStatus.STREAMING
+                    ) {
+                        GeometryDisplayTransformStatus.WAITING_FOR_OUTPUT_TRANSFORM
+                    } else {
+                        GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
+                    }
+                )
+            }
+            return null
+        }
 
         return try {
             val sourceTransform =
@@ -432,12 +563,27 @@ class CameraController(
 
             val values = FloatArray(9)
             matrix.getValues(values)
+            geometryTransformWarningLogged.set(false)
+            updatePreviewDiagnostics {
+                it.copy(
+                    outputTransformAvailable = true,
+                    geometryTransformStatus = GeometryDisplayTransformStatus.READY,
+                    lastTransformFailure = null
+                )
+            }
             FaceGeometryDisplayTransform(values.map { it })
         } catch (error: Exception) {
+            val failure = "${error.javaClass.simpleName}: ${error.message ?: "transform creation failed"}"
+            updatePreviewDiagnostics {
+                it.copy(
+                    geometryTransformStatus = GeometryDisplayTransformStatus.FAILED,
+                    lastTransformFailure = failure
+                )
+            }
             if (geometryTransformWarningLogged.compareAndSet(false, true)) {
                 Log.w(
                     TAG,
-                    "Exact MediaPipe-to-preview transform unavailable; using FILL_CENTER fallback",
+                    "Exact MediaPipe-to-preview transform unavailable; this frame will be skipped (no fallback projection is used)",
                     error
                 )
             }
@@ -467,6 +613,12 @@ class CameraController(
             _isMediaPipeFaceTracked.value = false
             faceGeometryHolder.clear()
             _geometryError.value = null
+            updatePreviewDiagnostics {
+                it.copy(
+                    geometryTransformStatus = GeometryDisplayTransformStatus.DISABLED,
+                    lastTransformFailure = null
+                )
+            }
 
             // Restore ML Kit immediately so new frames are no longer sent to MediaPipe.
             imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
@@ -486,6 +638,18 @@ class CameraController(
         _isMediaPipeGeometryEnabled.value = true
         _geometryError.value = null
         faceGeometryHolder.clear()
+        updatePreviewDiagnostics { current ->
+            current.copy(
+                geometryTransformStatus = when {
+                    current.previewStreamStatus != CameraPreviewStreamStatus.STREAMING ->
+                        GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
+                    !current.outputTransformAvailable ->
+                        GeometryDisplayTransformStatus.WAITING_FOR_OUTPUT_TRANSFORM
+                    else -> GeometryDisplayTransformStatus.READY
+                },
+                lastTransformFailure = null
+            )
+        }
 
         try {
             cameraExecutor.execute {
@@ -559,6 +723,12 @@ class CameraController(
         faceGeometryHolder.clear()
         _geometryError.value =
             "MediaPipe failed; returned to ML Kit: ${error.message ?: error.javaClass.simpleName}"
+        updatePreviewDiagnostics {
+            it.copy(
+                geometryTransformStatus = GeometryDisplayTransformStatus.DISABLED,
+                lastTransformFailure = null
+            )
+        }
 
         val providerToClose = mediaPipeProvider
         mediaPipeProvider = null
@@ -714,6 +884,13 @@ class CameraController(
 
             cachedGeometryPreviewTransform = null
             faceAnalyzer.updatePreviewOutputTransform(null)
+            updatePreviewDiagnostics {
+                it.copy(
+                    outputTransformAvailable = false,
+                    geometryTransformStatus = GeometryDisplayTransformStatus.DISABLED,
+                    lastTransformFailure = null
+                )
+            }
 
             cameraProvider?.unbindAll()
             imageAnalysis = null
@@ -723,6 +900,19 @@ class CameraController(
 
             _isCameraReady.value = false
             currentPreviewView = null
+            updatePreviewDiagnostics {
+                it.copy(
+                    previewStreamStatus = CameraPreviewStreamStatus.IDLE,
+                    previewViewAttached = false,
+                    previewWidth = 0,
+                    previewHeight = 0,
+                    viewPortAvailable = false,
+                    useCasesBound = false,
+                    outputTransformAvailable = false,
+                    geometryTransformStatus = GeometryDisplayTransformStatus.DISABLED,
+                    lastTransformFailure = null
+                )
+            }
 
             // Serialize FaceLandmarker.close() after any frame-conversion work already queued
             // on the CameraX analysis executor. shutdown() still drains queued tasks.

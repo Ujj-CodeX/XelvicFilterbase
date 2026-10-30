@@ -8,6 +8,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.os.SystemClock
 import android.util.AttributeSet
+import android.util.Log
 import com.example.xelvic.geometry.FaceGeometryRenderFrame
 import com.example.xelvic.geometry.FaceMeshTessellation
 import com.example.xelvic.geometry.FaceMeshUvMap
@@ -24,6 +25,20 @@ import com.example.BuildConfig
 enum class FaceMeshTextureUvMode {
     PINNED_CANONICAL,
     DIAGNOSTIC_FACE_SPACE
+}
+
+enum class FaceMeshGlRenderStatus {
+    NOT_MOUNTED,
+    WAITING_FOR_SURFACE,
+    NO_EFFECT,
+    WAITING_FOR_FRAME,
+    STALE_FRAME,
+    FRAME_REJECTED,
+    DRAWN,
+    SHADER_PROGRAM_UNAVAILABLE,
+    BACKEND_UNAVAILABLE,
+    TEXTURE_UPLOAD_FAILED,
+    GL_DRAW_FAILED
 }
 
 internal const val DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID = "diagnostic_face_space_v1"
@@ -132,6 +147,15 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
     /** Last routing/upload result for diagnostics; read it on the UI thread if needed. */
     val lastDecision: RenderBackendDecision
         get() = meshRenderer.lastDecision
+
+    val lastRenderStatus: FaceMeshGlRenderStatus
+        get() = meshRenderer.lastRenderStatus
+
+    fun setDiagnosticsListener(
+        listener: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?
+    ) {
+        meshRenderer.setDiagnosticsListener(listener)
+    }
 }
 
 private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
@@ -144,6 +168,32 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING
     )
         private set
+
+    @Volatile
+    var lastRenderStatus: FaceMeshGlRenderStatus = FaceMeshGlRenderStatus.WAITING_FOR_SURFACE
+        private set
+
+    @Volatile
+    private var diagnosticsListener:
+        ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)? = null
+
+    private var lastPublishedDecision: RenderBackendDecision? = null
+
+    fun setDiagnosticsListener(
+        listener: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?
+    ) {
+        diagnosticsListener = listener
+        listener?.invoke(lastRenderStatus, lastDecision)
+        lastPublishedDecision = lastDecision
+    }
+
+    private fun publishRenderStatus(status: FaceMeshGlRenderStatus) {
+        val decision = lastDecision
+        if (status == lastRenderStatus && decision == lastPublishedDecision) return
+        lastRenderStatus = status
+        lastPublishedDecision = decision
+        diagnosticsListener?.invoke(status, decision)
+    }
 
     private var surfaceWidth = 0
     private var surfaceHeight = 0
@@ -197,6 +247,9 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         maxTextureSize = maxSize[0]
         if (program == 0) {
             lastDecision = blocked(RenderBackendBlockReason.SHADER_PROGRAM_UNAVAILABLE)
+            publishRenderStatus(FaceMeshGlRenderStatus.SHADER_PROGRAM_UNAVAILABLE)
+        } else {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_FRAME)
         }
         textureId = 0
         attemptedEffect = null
@@ -207,11 +260,23 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         surfaceWidth = width
         surfaceHeight = height
         GLES20.glViewport(0, 0, width, height)
+        if (width <= 0 || height <= 0) {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_SURFACE)
+        } else if (program != 0) {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_FRAME)
+        }
     }
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        if (program == 0 || surfaceWidth <= 0 || surfaceHeight <= 0) return
+        if (program == 0) {
+            publishRenderStatus(FaceMeshGlRenderStatus.SHADER_PROGRAM_UNAVAILABLE)
+            return
+        }
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_SURFACE)
+            return
+        }
 
         val effect = selectedEffect.get()
         if (effect == null) {
@@ -222,6 +287,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
                 RenderBackend.UNAVAILABLE,
                 RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING
             )
+            publishRenderStatus(FaceMeshGlRenderStatus.NO_EFFECT)
             return
         }
 
@@ -231,10 +297,28 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             uploadedEffect = null
             uploadEffectIfSupported(effect)
         }
-        if (uploadedEffect !== effect || textureId == 0) return
+        if (uploadedEffect !== effect || textureId == 0) {
+            val status = when {
+                lastDecision.reason == RenderBackendBlockReason.TEXTURE_UPLOAD_FAILED ->
+                    FaceMeshGlRenderStatus.TEXTURE_UPLOAD_FAILED
+                lastDecision.backend == RenderBackend.UNAVAILABLE ->
+                    FaceMeshGlRenderStatus.BACKEND_UNAVAILABLE
+                else -> FaceMeshGlRenderStatus.TEXTURE_UPLOAD_FAILED
+            }
+            publishRenderStatus(status)
+            return
+        }
 
         val frame = latestFrame.get()
-        if (frame == null || SystemClock.uptimeMillis() - frame.snapshot.timestampMs > MAX_FRAME_AGE_MS) return
+        if (frame == null) {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_FRAME)
+            return
+        }
+        val frameAgeMs = SystemClock.uptimeMillis() - frame.snapshot.timestampMs
+        if (frameAgeMs < 0L || frameAgeMs > MAX_FRAME_AGE_MS) {
+            publishRenderStatus(FaceMeshGlRenderStatus.STALE_FRAME)
+            return
+        }
 
         val prepared = FaceMeshGlFrameBuilder.update(
             renderFrame = frame,
@@ -249,7 +333,10 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             mappedPoint = mappedPoint,
             uvMode = effect.uvMode
         )
-        if (!prepared) return
+        if (!prepared) {
+            publishRenderStatus(FaceMeshGlRenderStatus.FRAME_REJECTED)
+            return
+        }
 
         positionBuffer.clear()
         positionBuffer.put(positions)
@@ -276,11 +363,19 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         )
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(uvHandle)
+        val drawError = GLES20.glGetError()
+        if (drawError == GLES20.GL_NO_ERROR) {
+            publishRenderStatus(FaceMeshGlRenderStatus.DRAWN)
+        } else {
+            Log.e(TAG, "Face mesh draw failed with GL error 0x${Integer.toHexString(drawError)}")
+            publishRenderStatus(FaceMeshGlRenderStatus.GL_DRAW_FAILED)
+        }
     }
 
     private fun uploadEffectIfSupported(effect: FaceMeshGlEffect) {
         if (effect.bitmap.isRecycled) {
             lastDecision = blocked(RenderBackendBlockReason.TEXTURE_UPLOAD_FAILED)
+            publishRenderStatus(FaceMeshGlRenderStatus.TEXTURE_UPLOAD_FAILED)
             return
         }
         val requirements = FaceMeshTextureRequirements(
@@ -305,7 +400,10 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             )
         )
         lastDecision = decision
-        if (decision.backend != RenderBackend.FACE_MESH_GL) return
+        if (decision.backend != RenderBackend.FACE_MESH_GL) {
+            publishRenderStatus(FaceMeshGlRenderStatus.BACKEND_UNAVAILABLE)
+            return
+        }
 
         try {
             val ids = IntArray(1)
@@ -324,10 +422,13 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
                 throw IllegalStateException("Texture upload failed with GL error 0x${Integer.toHexString(error)}")
             }
             uploadedEffect = effect
-        } catch (_: Exception) {
+            publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_FRAME)
+        } catch (error: Exception) {
+            Log.e(TAG, "Face mesh texture upload failed", error)
             releaseTexture()
             uploadedEffect = null
             lastDecision = blocked(RenderBackendBlockReason.TEXTURE_UPLOAD_FAILED)
+            publishRenderStatus(FaceMeshGlRenderStatus.TEXTURE_UPLOAD_FAILED)
         }
     }
 
@@ -362,6 +463,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         GLES20.glDeleteShader(vertex)
         GLES20.glDeleteShader(fragment)
         if (status[0] != GLES20.GL_TRUE) {
+            Log.e(TAG, "Shader program link failed: ${GLES20.glGetProgramInfoLog(result)}")
             GLES20.glDeleteProgram(result)
             return 0
         }
@@ -376,6 +478,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         val status = IntArray(1)
         GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
         if (status[0] != GLES20.GL_TRUE) {
+            Log.e(TAG, "Shader compilation failed: ${GLES20.glGetShaderInfoLog(shader)}")
             GLES20.glDeleteShader(shader)
             return null
         }
@@ -394,6 +497,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             .apply { put(values); position(0) }
 
     private companion object {
+        const val TAG = "FaceMeshGlOverlay"
         const val MAX_FRAME_AGE_MS = 250L
 
         val VERTEX_SHADER =

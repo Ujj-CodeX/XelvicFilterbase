@@ -11,6 +11,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.renderer.FaceMeshGlEffect
 import com.example.xelvic.renderer.FaceMeshGlOverlayView
+import com.example.xelvic.renderer.FaceMeshGlRenderStatus
+import com.example.xelvic.renderer.RenderBackendDecision
 
 /**
  * Hosts the GLES face-texture overlay and binds it to the latest snapshot/transform pair.
@@ -21,7 +23,8 @@ internal fun FaceMeshTextureOverlay(
     holder: FaceGeometrySnapshotHolder,
     effect: FaceMeshGlEffect?,
     enabled: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onRenderStatus: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)? = null
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val viewRef = remember { arrayOfNulls<FaceMeshGlOverlayView>(1) }
@@ -38,6 +41,9 @@ internal fun FaceMeshTextureOverlay(
         },
         update = { view ->
             viewRef[0] = view
+            view.setDiagnosticsListener { status, decision ->
+                view.post { onRenderStatus?.invoke(status, decision) }
+            }
             view.setSnapshotHolder(if (enabled) holder else null)
             view.setEffect(if (enabled) effect else null)
         },
@@ -57,6 +63,7 @@ internal fun FaceMeshTextureOverlay(
 
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            viewRef[0]?.setDiagnosticsListener(null)
             viewRef[0]?.setSnapshotHolder(null)
             viewRef[0]?.setEffect(null)
             viewRef[0]?.onPause()

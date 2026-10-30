@@ -81,8 +81,10 @@ import com.example.xelvic.model.FilterRenderer
 import com.example.xelvic.renderer.FaceMeshEffectBlockReason
 import com.example.xelvic.renderer.FaceMeshEffectResolution
 import com.example.xelvic.renderer.FaceMeshEffectResolver
-
-
+import com.example.xelvic.renderer.FaceMeshGlRenderStatus
+import com.example.xelvic.renderer.RenderBackendDecision
+import com.example.xelvic.renderer.RenderBackend
+import com.example.xelvic.renderer.RenderBackendBlockReason
 @androidx.annotation.OptIn(TransformExperimental::class)
 @OptIn(TransformExperimental::class)
 @Composable
@@ -105,6 +107,21 @@ fun CameraScreen(
     val context = LocalContext.current
     val isMediaPipeGeometryEnabled by cameraController.isMediaPipeGeometryEnabled.collectAsState()
     val isMediaPipeFaceTracked by cameraController.isMediaPipeFaceTracked.collectAsState()
+    val previewDiagnostics by cameraController.previewDiagnostics.collectAsState()
+    val isCameraReady by cameraController.isCameraReady.collectAsState()
+    val cameraError by cameraController.cameraError.collectAsState()
+
+    var meshGlRenderStatus by remember {
+        mutableStateOf(FaceMeshGlRenderStatus.NOT_MOUNTED)
+    }
+    var meshBackendDecision by remember {
+        mutableStateOf(
+            RenderBackendDecision(
+                RenderBackend.UNAVAILABLE,
+                RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING
+            )
+        )
+    }
 
     val uvRegistry = remember(context) {
         FaceMeshUvRegistry(
@@ -163,6 +180,12 @@ fun CameraScreen(
     val activeMeshEffect =
         (meshEffectResolution as? FaceMeshEffectResolution.Ready)?.effect
 
+    LaunchedEffect(isMeshTextureSelected, activeMeshEffect) {
+        if (!isMeshTextureSelected || activeMeshEffect == null) {
+            meshGlRenderStatus = FaceMeshGlRenderStatus.NOT_MOUNTED
+        }
+    }
+
     val geometryError by cameraController.geometryError.collectAsState()
     val faceLockedForDisplay =
         if (isMediaPipeGeometryEnabled) isMediaPipeFaceTracked else isFaceLocked
@@ -216,11 +239,73 @@ fun CameraScreen(
                 holder = cameraController.faceGeometryHolder,
                 effect = activeMeshEffect,
                 enabled = true,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize(),
+                onRenderStatus = { status, decision ->
+                    meshGlRenderStatus = status
+                    meshBackendDecision = decision
+                }
             )
         }
 
-
+        if (showDebugOverlay) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 12.dp, bottom = 176.dp),
+                color = Color(0xE6101722),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0x665F7185))
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text(
+                        "CameraX: ${previewDiagnostics.previewStreamStatus} · bound=${previewDiagnostics.useCasesBound || isCameraReady}",
+                        color = Color.White,
+                        fontSize = 10.sp
+                    )
+                    Text(
+                        "View: ${previewDiagnostics.previewWidth}×${previewDiagnostics.previewHeight} · ViewPort=${previewDiagnostics.viewPortAvailable}",
+                        color = Color.White,
+                        fontSize = 10.sp
+                    )
+                    Text(
+                        "Output transform: ${previewDiagnostics.outputTransformAvailable} · ${previewDiagnostics.geometryTransformStatus}",
+                        color = Color.White,
+                        fontSize = 10.sp
+                    )
+                    if (previewDiagnostics.lastTransformFailure != null) {
+                        Text(
+                            "Transform error: ${previewDiagnostics.lastTransformFailure}",
+                            color = Color(0xFFFFCC80),
+                            fontSize = 9.sp
+                        )
+                    }
+                    if (isMeshTextureSelected) {
+                        Text(
+                            "GL: ${meshGlRenderStatus} · ${meshBackendDecision.reason}",
+                            color = Color(0xFF80DEEA),
+                            fontSize = 10.sp
+                        )
+                    }
+                    if (cameraError != null) {
+                        Text(
+                            "Camera error: $cameraError",
+                            color = Color(0xFFFF8A80),
+                            fontSize = 9.sp
+                        )
+                    }
+                    if (geometryError != null) {
+                        Text(
+                            "Geometry error: $geometryError",
+                            color = Color(0xFFFFCC80),
+                            fontSize = 9.sp
+                        )
+                    }
+                }
+            }
+        }
 
         // 3. Top Control Bar
         Column(
