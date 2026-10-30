@@ -8,6 +8,7 @@ import androidx.camera.core.ImageProxy
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.example.xelvic.model.FilterRenderer
 import com.example.xelvic.model.InstalledFilter
 import com.example.xelvic.renderer.StickerRenderer
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -22,7 +23,8 @@ data class PhotoProcessResult(
 
 class PhotoProcessor(
     private val coordinateMapper: CoordinateMapper,
-    private val stickerRenderer: StickerRenderer
+    private val stickerRenderer: StickerRenderer,
+    private val faceMeshPhotoProcessor: FaceMeshPhotoProcessor? = null
 ) {
 
     private fun recycleBitmapSafely(bitmap: Bitmap?) {
@@ -128,8 +130,43 @@ class PhotoProcessor(
         uprightBitmap: Bitmap,
         filter: InstalledFilter?,
         isFrontCamera: Boolean
-    ): PhotoProcessResult =
-        suspendCancellableCoroutine { continuation ->
+    ): PhotoProcessResult {
+        if (filter?.definition?.renderer == FilterRenderer.FACE_MESH_TEXTURE) {
+            return suspendCancellableCoroutine { continuation ->
+                if (!continuation.isActive) {
+                    recycleBitmapSafely(uprightBitmap)
+                    return@suspendCancellableCoroutine
+                }
+
+                val result = try {
+                    val meshProcessor = faceMeshPhotoProcessor
+                    if (meshProcessor == null) {
+                        PhotoProcessResult(
+                            bitmap = uprightBitmap,
+                            faceFound = false,
+                            message = "Mesh photo processor is not configured."
+                        )
+                    } else {
+                        meshProcessor.process(uprightBitmap, filter)
+                    }
+                } catch (error: Exception) {
+                    PhotoProcessResult(
+                        bitmap = uprightBitmap,
+                        faceFound = false,
+                        message = "Mesh photo processing failed: ${error.message}"
+                    )
+                }
+
+                if (result.bitmap !== uprightBitmap) {
+                    recycleBitmapSafely(uprightBitmap)
+                }
+                continuation.resume(result) { _, undeliveredResult, _ ->
+                    recycleBitmapSafely(undeliveredResult.bitmap)
+                }
+            }
+        }
+
+        return suspendCancellableCoroutine { continuation ->
 
             /*
              * Use the cancellable continuation even when no filter is
@@ -273,12 +310,18 @@ class PhotoProcessor(
                 }
             }
         }
+    }
 
     fun release() {
         try {
             photoDetector.close()
         } catch (e: Exception) {
             // Ignore close exceptions
+        }
+        try {
+            faceMeshPhotoProcessor?.close()
+        } catch (_: Exception) {
+            // Best-effort close of the still-image Face Landmarker.
         }
     }
 }

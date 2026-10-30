@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.xelvic.camera.CameraController
 import com.example.xelvic.camera.CoordinateMapper
 import com.example.xelvic.camera.FaceAnalyzer
+import com.example.xelvic.camera.FaceMeshPhotoProcessor
 import com.example.xelvic.camera.PhotoProcessResult
 import com.example.xelvic.camera.PhotoProcessor
 import com.example.xelvic.model.FaceTrackingResult
@@ -40,7 +41,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val filterRepository = FilterRepository(application)
     val coordinateMapper = CoordinateMapper()
     val stickerRenderer = StickerRenderer()
-    val photoProcessor = PhotoProcessor(coordinateMapper, stickerRenderer)
+    private val faceMeshPhotoProcessor = FaceMeshPhotoProcessor(application)
+    val photoProcessor = PhotoProcessor(
+        coordinateMapper = coordinateMapper,
+        stickerRenderer = stickerRenderer,
+        faceMeshPhotoProcessor = faceMeshPhotoProcessor
+    )
 
     // Performance monitor and adaptive controller
     val performanceMonitor = PerformanceMonitor(application)
