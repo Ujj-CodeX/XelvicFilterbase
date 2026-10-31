@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Rect
 import androidx.camera.core.ImageProxy
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
@@ -20,6 +21,64 @@ data class PhotoProcessResult(
     val faceFound: Boolean,
     val message: String? = null
 )
+
+/**
+ * Applies the ImageProxy viewport crop in source-image coordinates, then preserves the
+ * existing upright rotation and front-camera mirror transform.
+ *
+ * The source bitmap remains caller-owned. The caller decides whether it can be recycled
+ * after receiving a distinct output bitmap.
+ */
+internal fun createUprightCaptureBitmap(
+    sourceBitmap: Bitmap,
+    cropRect: Rect,
+    rotationDegrees: Int,
+    isFrontCamera: Boolean
+): Bitmap {
+    require(
+        rotationDegrees == 0 ||
+            rotationDegrees == 90 ||
+            rotationDegrees == 180 ||
+            rotationDegrees == 270
+    ) { "Unsupported image rotation: $rotationDegrees" }
+
+    require(!cropRect.isEmpty) { "Captured image crop rectangle is empty" }
+    require(
+        cropRect.left >= 0 &&
+            cropRect.top >= 0 &&
+            cropRect.right <= sourceBitmap.width &&
+            cropRect.bottom <= sourceBitmap.height
+    ) {
+        "Captured image crop rectangle $cropRect is outside decoded bitmap bounds " +
+            " (0, 0, " + sourceBitmap.width + ", " + sourceBitmap.height + ")"
+    }
+
+    val fullImageRect = Rect(0, 0, sourceBitmap.width, sourceBitmap.height)
+    val includesFullImage = cropRect == fullImageRect
+
+    val matrix = Matrix()
+    if (rotationDegrees != 0) {
+        matrix.postRotate(rotationDegrees.toFloat())
+    }
+    if (isFrontCamera) {
+        matrix.postScale(-1f, 1f)
+    }
+
+    // Keep the original bitmap only when neither cropping nor transformation is needed.
+    if (includesFullImage && matrix.isIdentity) {
+        return sourceBitmap
+    }
+
+    return Bitmap.createBitmap(
+        sourceBitmap,
+        cropRect.left,
+        cropRect.top,
+        cropRect.width(),
+        cropRect.height(),
+        matrix,
+        true
+    )
+}
 
 class PhotoProcessor(
     private val coordinateMapper: CoordinateMapper,
@@ -77,35 +136,16 @@ class PhotoProcessor(
         )
 
         try {
-            val rotationDegrees =
-                imageProxy.imageInfo.rotationDegrees.toFloat()
+            // CameraX carries the shared PreviewView viewport crop as ImageProxy metadata.
+            // Apply it before rotation/mirroring so review and save use the preview field of view.
+            val uprightBitmap = createUprightCaptureBitmap(
+                sourceBitmap = rawBitmap,
+                cropRect = Rect(imageProxy.cropRect),
+                rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                isFrontCamera = isFrontCamera
+            )
 
-            val matrix = Matrix()
-
-            if (rotationDegrees != 0f) {
-                matrix.postRotate(rotationDegrees)
-            }
-
-            if (isFrontCamera) {
-                matrix.postScale(-1f, 1f)
-            }
-
-            val uprightBitmap =
-                if (!matrix.isIdentity) {
-                    Bitmap.createBitmap(
-                        rawBitmap,
-                        0,
-                        0,
-                        rawBitmap.width,
-                        rawBitmap.height,
-                        matrix,
-                        true
-                    )
-                } else {
-                    rawBitmap
-                }
-
-            // Ownership of a new transformed bitmap is returned to the caller.
+            // Ownership of a new cropped/transformed bitmap is returned to the caller.
             if (uprightBitmap !== rawBitmap) {
                 rawBitmap.recycle()
             }
