@@ -108,15 +108,18 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
         snapshotListenerHandle = null
         attachedHolder = next
 
-        publishFrame(next?.getLatest())
-
         if (next != null) {
+            // Subscribe before reading the current frame so an update published while this
+            // holder is being attached cannot fall into a read-before-subscribe race.
             snapshotListenerHandle = next.addSnapshotListener {
                 if (attachedHolder === next) {
                     publishFrame(next.getLatest())
                 }
             }
         }
+
+        // This read also covers a frame published immediately before subscription completed.
+        publishFrame(next?.getLatest())
     }
 
     override fun onDetachedFromWindow() {
