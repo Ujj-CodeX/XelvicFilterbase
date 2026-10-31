@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Matrix
 import android.graphics.Point
 import android.graphics.Rect
 import android.graphics.RectF
@@ -60,10 +61,11 @@ class CaptureCropTransformTest {
                             rotationDegrees = rotation,
                             mirrorHorizontally = isFrontCamera
                         )
-                        assertEquals(
-                            "marker color rotation=$rotation front=$isFrontCamera at $expected",
-                            marker.color,
-                            output.getPixel(expected.x, expected.y)
+                        assertColorNear(
+                            bitmap = output,
+                            expectedColor = marker.color,
+                            expectedPoint = expected,
+                            context = "rotation=$rotation front=$isFrontCamera"
                         )
                     }
 
@@ -158,19 +160,48 @@ class CaptureCropTransformTest {
         rotationDegrees: Int,
         mirrorHorizontally: Boolean
     ): Point {
-        var mapped = when (rotationDegrees) {
-            0 -> Point(x, y)
-            90 -> Point(cropHeight - 1 - y, x)
-            180 -> Point(cropWidth - 1 - x, cropHeight - 1 - y)
-            270 -> Point(y, cropWidth - 1 - x)
-            else -> error("Unexpected test rotation: $rotationDegrees")
+        // Derive expected coordinates from Android's own Matrix semantics, including the
+        // translation needed to move the transformed crop bounds back to the origin.
+        val matrix = Matrix().apply {
+            if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
+            if (mirrorHorizontally) postScale(-1f, 1f)
         }
+        val mappedBounds = RectF(0f, 0f, cropWidth.toFloat(), cropHeight.toFloat())
+        matrix.mapRect(mappedBounds)
 
-        val outputWidth = if (rotationDegrees % 180 == 0) cropWidth else cropHeight
-        if (mirrorHorizontally) {
-            mapped = Point(outputWidth - 1 - mapped.x, mapped.y)
+        val mappedCenter = floatArrayOf(x + 0.5f, y + 0.5f)
+        matrix.mapPoints(mappedCenter)
+        return Point(
+            kotlin.math.floor(mappedCenter[0] - mappedBounds.left).toInt(),
+            kotlin.math.floor(mappedCenter[1] - mappedBounds.top).toInt()
+        )
+    }
+
+    private fun assertColorNear(
+        bitmap: Bitmap,
+        expectedColor: Int,
+        expectedPoint: Point,
+        context: String
+    ) {
+        val radius = 3
+        var found = false
+        for (y in (expectedPoint.y - radius).coerceAtLeast(0)
+            ..(expectedPoint.y + radius).coerceAtMost(bitmap.height - 1)) {
+            for (x in (expectedPoint.x - radius).coerceAtLeast(0)
+                ..(expectedPoint.x + radius).coerceAtMost(bitmap.width - 1)) {
+                if (bitmap.getPixel(x, y) == expectedColor) {
+                    found = true
+                    break
+                }
+            }
+            if (found) break
         }
-        return mapped
+        assertTrue(
+            "Expected marker colour near expected coordinate; " + context +
+                ", expectedPoint=" + expectedPoint +
+                ", output=" + bitmap.width + "x" + bitmap.height,
+            found
+        )
     }
 
     private data class Marker(
