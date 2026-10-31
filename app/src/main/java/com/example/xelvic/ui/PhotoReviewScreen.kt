@@ -66,9 +66,9 @@ fun PhotoReviewScreen(
     var isSaving by remember { mutableStateOf(false) }
     var isSaved by remember { mutableStateOf(false) }
 
-    // System Back Button triggers Retake
+    // Consume Back while saving so the review bitmap remains available to the save operation.
     BackHandler {
-        onRetake()
+        if (!isSaving) onRetake()
     }
 
     Box(
@@ -165,6 +165,7 @@ fun PhotoReviewScreen(
                 // Retake Button
                 OutlinedButton(
                     onClick = onRetake,
+                    enabled = !isSaving,
                     modifier = Modifier
                         .weight(1f)
                         .height(54.dp)

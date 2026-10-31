@@ -72,11 +72,25 @@ class FaceMeshPhotoProcessor(
                 message = "Mesh photo filter is unavailable: ${resolution.describeBlock()}"
             )
 
-        val mpImage = BitmapImageBuilder(bitmap).build()
+        // The input bitmap is borrowed from PhotoProcessor. MediaPipe's BitmapImageContainer
+        // recycles the bitmap supplied to it when MPImage.close() is called, so never pass the
+        // caller-owned review candidate directly to BitmapImageBuilder.
+        val inferenceBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            ?: throw IllegalStateException("Could not allocate MediaPipe inference bitmap")
+
         val faceLandmarks = try {
-            landmarkerDelegate.value.detect(mpImage).faceLandmarks().firstOrNull()
+            val mpImage = BitmapImageBuilder(inferenceBitmap).build()
+            try {
+                landmarkerDelegate.value.detect(mpImage).faceLandmarks().firstOrNull()
+            } finally {
+                mpImage.close()
+            }
         } finally {
-            mpImage.close()
+            // MPImage.close() normally releases this bitmap. Keep this guarded cleanup for
+            // failures that occur before MPImage is successfully built or closed.
+            if (!inferenceBitmap.isRecycled) {
+                inferenceBitmap.recycle()
+            }
         }
 
         if (faceLandmarks.isNullOrEmpty()) {

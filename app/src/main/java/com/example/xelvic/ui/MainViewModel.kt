@@ -138,13 +138,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Retake action: discards uncommitted photo and resumes camera pipeline.
      */
     fun retakePhoto() {
-        val currentReview = _reviewState.value
+        // Compose's BitmapPainter may still be drawing the review image while this state
+        // transition is being applied. Do not recycle a bitmap that was handed to the UI;
+        // once all UI/save references are gone, normal Bitmap/GC lifetime can reclaim it.
         _reviewState.value = null
-        currentReview?.bitmap?.let { bmp ->
-            if (!bmp.isRecycled) {
-                bmp.recycle()
-            }
-        }
         stickerRenderer.resetSmoothing()
     }
 
