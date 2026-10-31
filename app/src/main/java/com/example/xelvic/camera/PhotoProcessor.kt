@@ -56,6 +56,20 @@ internal fun createUprightCaptureBitmap(
     val fullImageRect = Rect(0, 0, sourceBitmap.width, sourceBitmap.height)
     val includesFullImage = cropRect == fullImageRect
 
+    // Materialize the viewport crop first. This keeps subsequent Matrix operations in the
+    // cropped image's own coordinate space and avoids mixing source offsets with rotation.
+    val croppedBitmap = if (includesFullImage) {
+        sourceBitmap
+    } else {
+        Bitmap.createBitmap(
+            sourceBitmap,
+            cropRect.left,
+            cropRect.top,
+            cropRect.width(),
+            cropRect.height()
+        )
+    }
+
     val matrix = Matrix()
     if (rotationDegrees != 0) {
         matrix.postRotate(rotationDegrees.toFloat())
@@ -64,20 +78,33 @@ internal fun createUprightCaptureBitmap(
         matrix.postScale(-1f, 1f)
     }
 
-    // Keep the original bitmap only when neither cropping nor transformation is needed.
-    if (includesFullImage && matrix.isIdentity) {
-        return sourceBitmap
+    // No orientation transform is needed; transfer the cropped bitmap to the caller.
+    if (matrix.isIdentity) {
+        return croppedBitmap
     }
 
-    return Bitmap.createBitmap(
-        sourceBitmap,
-        cropRect.left,
-        cropRect.top,
-        cropRect.width(),
-        cropRect.height(),
-        matrix,
-        true
-    )
+    try {
+        val transformedBitmap = Bitmap.createBitmap(
+            croppedBitmap,
+            0,
+            0,
+            croppedBitmap.width,
+            croppedBitmap.height,
+            matrix,
+            true
+        )
+        if (croppedBitmap !== sourceBitmap && transformedBitmap !== croppedBitmap &&
+            !croppedBitmap.isRecycled
+        ) {
+            croppedBitmap.recycle()
+        }
+        return transformedBitmap
+    } catch (error: Throwable) {
+        if (croppedBitmap !== sourceBitmap && !croppedBitmap.isRecycled) {
+            croppedBitmap.recycle()
+        }
+        throw error
+    }
 }
 
 class PhotoProcessor(
