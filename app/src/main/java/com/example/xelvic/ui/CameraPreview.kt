@@ -56,6 +56,13 @@ fun CameraPreview(
                 onPreviewViewCreated?.invoke(this)
             }
         },
+        update = { previewView ->
+            if (previewView.scaleType != scaleType) previewView.scaleType = scaleType
+            if (previewView.implementationMode != implementationMode) {
+                previewView.implementationMode = implementationMode
+            }
+            cameraController.onPreviewViewUpdated(previewView)
+        },
         modifier = modifier
             .testTag("camera_preview")
             .onSizeChanged { size ->

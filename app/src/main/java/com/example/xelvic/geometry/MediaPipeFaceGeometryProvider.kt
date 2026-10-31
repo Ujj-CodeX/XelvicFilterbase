@@ -4,8 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
+import com.example.BuildConfig
+import com.example.xelvic.perf.DiagnosticRateLimiter
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -13,10 +16,68 @@ import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.security.MessageDigest
+
+internal interface AsyncFaceLandmarkerTask : AutoCloseable {
+    fun detectAsync(image: MPImage, timestampMs: Long)
+}
+
+internal fun interface AsyncFaceLandmarkerTaskFactory {
+    fun create(
+        context: Context,
+        modelAssetPath: String,
+        onResult: (FaceLandmarkerResult, MPImage?) -> Unit,
+        onError: (RuntimeException) -> Unit
+    ): AsyncFaceLandmarkerTask
+}
+
+internal interface InferenceWatchdogScheduler : AutoCloseable {
+    fun schedule(timeoutMs: Long, action: () -> Unit): AutoCloseable
+}
+
+private class ScheduledInferenceWatchdog : InferenceWatchdogScheduler {
+    private val executor = Executors.newSingleThreadScheduledExecutor { action ->
+        Thread(action, "MediaPipeInferenceWatchdog").apply { isDaemon = true }
+    }
+
+    override fun schedule(timeoutMs: Long, action: () -> Unit): AutoCloseable {
+        val future = executor.schedule(action, timeoutMs, TimeUnit.MILLISECONDS)
+        return AutoCloseable { future.cancel(false) }
+    }
+
+    override fun close() { executor.shutdownNow() }
+}
+
+enum class InferenceWatchdogStatus { IDLE, ARMED, TIMED_OUT, CLOSED }
+
+/** Immutable, sampled ImageProxy/inference metadata for debug device validation only. */
+data class MediaPipeFrameDiagnostics(
+    val sourceWidth: Int,
+    val sourceHeight: Int,
+    val cropLeft: Int,
+    val cropTop: Int,
+    val cropRight: Int,
+    val cropBottom: Int,
+    val rotationDegrees: Int,
+    val inferenceWidth: Int,
+    val inferenceHeight: Int,
+    val timestampMs: Long,
+    val geometrySessionGeneration: Long?
+)
+
+/** Detection is bounded; FaceLandmarker graph shutdown/recreation is not. */
+class MediaPipeInferenceTimeoutException internal constructor(timestampMs: Long, sessionGeneration: Long?) :
+    IllegalStateException(
+        "MediaPipe inference $timestampMs (geometry session=$sessionGeneration) did not complete " +
+            "within ${MediaPipeFaceGeometryProvider.INFERENCE_COMPLETION_TIMEOUT_MS}ms"
+    )
 
 /**
  * MediaPipe Face Landmarker implementation for the existing CameraX YUV_420_888 stream.
@@ -27,48 +88,70 @@ import java.security.MessageDigest
  *
  * This is an isolated provider. It intentionally does not replace or mutate FaceAnalyzer.
  */
-class MediaPipeFaceGeometryProvider(
+class MediaPipeFaceGeometryProvider private constructor(
     context: Context,
-    private val modelAssetPath: String = DEFAULT_MODEL_ASSET
+    private val modelAssetPath: String,
+    taskFactory: AsyncFaceLandmarkerTaskFactory,
+    private val watchdogScheduler: InferenceWatchdogScheduler,
+    private val shutdownExecutor: Executor
 ) : FaceGeometryProvider {
+
+    constructor(context: Context, modelAssetPath: String = DEFAULT_MODEL_ASSET) : this(
+        context, modelAssetPath, DEFAULT_TASK_FACTORY, ScheduledInferenceWatchdog(),
+        Executor { action -> Thread(action, "MediaPipeFaceGeometryClose").apply { isDaemon = true }.start() }
+    )
+
+    /** Tests replace only native task/scheduling boundaries, never transforms or bitmap ownership. */
+    internal constructor(
+        context: Context,
+        taskFactory: AsyncFaceLandmarkerTaskFactory,
+        watchdogScheduler: InferenceWatchdogScheduler,
+        shutdownExecutor: Executor
+    ) : this(context, DEFAULT_MODEL_ASSET, taskFactory, watchdogScheduler, shutdownExecutor)
 
     private val appContext = context.applicationContext
     private val closed = AtomicBoolean(false)
     private val inferenceInFlight = AtomicBoolean(false)
     private val lastTimestampMs = AtomicLong(-1L)
     private val pendingFrame = AtomicReference<PendingFrame?>(null)
-    private val resultGenerationLock = Any()
-    private var resultGeneration = 0L
+    private val submissionLock = Any()
+    private val shutdownStarted = AtomicBoolean(false)
+    private val shutdownComplete = AtomicBoolean(false)
+    private val shutdownFailureObserved = AtomicBoolean(false)
+    private val shutdownErrorLogged = AtomicBoolean(false)
+    private val _watchdogStatus = AtomicReference(InferenceWatchdogStatus.IDLE)
+    val watchdogStatus: InferenceWatchdogStatus get() = _watchdogStatus.get()
+    val isInferenceInFlight: Boolean get() = inferenceInFlight.get()
+    val isShutdownComplete: Boolean get() = shutdownComplete.get()
+    private val droppedFrames = AtomicLong(0L)
+    val debugDroppedFrames: Long get() = droppedFrames.get()
+    private val frameDiagnostics = AtomicReference<MediaPipeFrameDiagnostics?>(null)
+    val debugFrameDiagnostics: MediaPipeFrameDiagnostics? get() = frameDiagnostics.get()
+    private val diagnosticLogLimiter = DiagnosticRateLimiter(1_000L)
+    private val rejectedFrameSampleLimiter = DiagnosticRateLimiter(1_000L)
     private val resultListener = AtomicReference<(FaceGeometrySnapshot?, FaceGeometryDisplayTransform?) -> Unit>({ _, _ -> })
+    private val sessionResultListener =
+        AtomicReference<((FaceGeometrySnapshot?, FaceGeometryDisplayTransform?, Long) -> Unit)?>(null)
     private val errorListener = AtomicReference<((Throwable) -> Unit)?>(null)
+    private val pendingError = AtomicReference<Throwable?>(null)
+    private val errorDelivered = AtomicBoolean(false)
+    private val initializationFinished = CountDownLatch(1)
 
     private val modelAssetSha256: String
 
-    private val landmarker: FaceLandmarker
+    private val landmarker = AtomicReference<AsyncFaceLandmarkerTask?>(null)
 
     init {
-        requireModelAsset()
-        modelAssetSha256 = calculateModelAssetSha256()
-
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(modelAssetPath)
-            .setDelegate(Delegate.CPU)
-            .build()
-
-        val options = FaceLandmarker.FaceLandmarkerOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumFaces(1)
-            .setMinFaceDetectionConfidence(DEFAULT_CONFIDENCE)
-            .setMinFacePresenceConfidence(DEFAULT_CONFIDENCE)
-            .setMinTrackingConfidence(DEFAULT_CONFIDENCE)
-            .setOutputFaceBlendshapes(true)
-            .setOutputFacialTransformationMatrixes(true)
-            .setResultListener { result, _ -> handleResult(result) }
-            .setErrorListener { error -> handleError(error) }
-            .build()
-
-        landmarker = FaceLandmarker.createFromOptions(appContext, options)
+        try {
+            requireModelAsset()
+            modelAssetSha256 = calculateModelAssetSha256()
+            landmarker.set(taskFactory.create(appContext, modelAssetPath, ::handleResult, ::handleError))
+        } catch (error: Exception) {
+            watchdogScheduler.close()
+            throw error
+        } finally {
+            initializationFinished.countDown()
+        }
     }
 
     override fun setResultListener(
@@ -77,18 +160,15 @@ class MediaPipeFaceGeometryProvider(
         resultListener.set(listener)
     }
 
-    override fun setErrorListener(listener: ((Throwable) -> Unit)?) {
-        errorListener.set(listener)
+    fun setSessionResultListener(
+        listener: (FaceGeometrySnapshot?, FaceGeometryDisplayTransform?, Long) -> Unit
+    ) {
+        sessionResultListener.set(listener)
     }
 
-    /**
-     * Retires the result currently in flight without closing the persistent tracker. The inference
-     * may finish normally, but geometry captured for an old PreviewView/camera session is dropped.
-     */
-    fun invalidatePendingFrames() {
-        synchronized(resultGenerationLock) {
-            resultGeneration++
-        }
+    override fun setErrorListener(listener: ((Throwable) -> Unit)?) {
+        errorListener.set(listener)
+        deliverPendingError()
     }
 
     override fun submitFrame(
@@ -97,7 +177,8 @@ class MediaPipeFaceGeometryProvider(
         isMirrored: Boolean,
         displayTransform: FaceGeometryDisplayTransform?
     ) {
-        if (closed.get()) {
+        if (closed.get() || displayTransform?.session?.isCurrent == false) {
+            recordDroppedFrame()
             closeProxySafely(imageProxy)
             return
         }
@@ -105,15 +186,16 @@ class MediaPipeFaceGeometryProvider(
         // Keep at most one owned bitmap/inference in flight. CameraX's KEEP_ONLY_LATEST
         // cannot protect against a slow asynchronous consumer after the proxy is handed off.
         if (!inferenceInFlight.compareAndSet(false, true)) {
+            recordDroppedFrame()
             closeProxySafely(imageProxy)
             return
         }
 
-        val frameResultGeneration =
-            synchronized(resultGenerationLock) { resultGeneration }
         var proxyClosed = false
         var sourceBitmap: Bitmap? = null
         var inferenceBitmap: Bitmap? = null
+        var ownedFrame: PendingFrame? = null
+        var submittedToNative = false
 
         try {
             check(imageProxy.format == ImageFormat.YUV_420_888) {
@@ -123,6 +205,13 @@ class MediaPipeFaceGeometryProvider(
             sourceBitmap = yuv420888ToBitmap(imageProxy)
             val sourceBitmapOwned = checkNotNull(sourceBitmap)
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+            val sourceDiagnostics = if (BuildConfig.DEBUG) {
+                val crop = imageProxy.cropRect
+                MediaPipeFrameDiagnostics(
+                    imageProxy.width, imageProxy.height, crop.left, crop.top, crop.right, crop.bottom,
+                    rotationDegrees, 0, 0, 0L, displayTransform?.session?.generation
+                )
+            } else null
 
             proxyClosed = true
             imageProxy.close()
@@ -135,10 +224,15 @@ class MediaPipeFaceGeometryProvider(
             inferenceBitmap = rotatedBitmap
 
             val timestamp = monotonicTimestamp(timestampMs)
+            sourceDiagnostics?.let {
+                frameDiagnostics.set(it.copy(
+                    inferenceWidth = rotatedBitmap.width, inferenceHeight = rotatedBitmap.height,
+                    timestampMs = timestamp
+                ))
+            }
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
             val frame = PendingFrame(
                 timestampMs = timestamp,
-                resultGeneration = frameResultGeneration,
                 imageWidth = rotatedBitmap.width,
                 imageHeight = rotatedBitmap.height,
                 rotationDegrees = rotationDegrees,
@@ -147,52 +241,99 @@ class MediaPipeFaceGeometryProvider(
                 bitmap = rotatedBitmap,
                 mpImage = mpImage
             )
+            ownedFrame = frame
             inferenceBitmap = null // ownership transferred to PendingFrame
 
-            synchronized(resultGenerationLock) {
-                if (frameResultGeneration != resultGeneration || closed.get()) {
-                    frame.release()
-                    inferenceInFlight.set(false)
-                    return
+            val accepted = synchronized(submissionLock) {
+                if (displayTransform?.session?.isCurrent == false || closed.get()) {
+                    false
+                } else {
+                    pendingFrame.set(frame)
+                    _watchdogStatus.set(InferenceWatchdogStatus.ARMED)
+                    true
                 }
-                pendingFrame.set(frame)
-                landmarker.detectAsync(frame.mpImage, frame.timestampMs)
             }
+            if (!accepted) {
+                frame.allowReleaseAfterNativeCompletion() // Never submitted; no native consumer.
+                return
+            }
+            frame.attachWatchdog(watchdogScheduler.schedule(INFERENCE_COMPLETION_TIMEOUT_MS) {
+                handleInferenceTimeout(frame)
+            })
+            // No state lock is held across the native call or any listener it may invoke.
+            submittedToNative = true
+            checkNotNull(landmarker.get()).detectAsync(frame.mpImage, frame.timestampMs)
+            logDiagnosticsIfDue()
         } catch (error: Exception) {
             sourceBitmap?.recycle()
             inferenceBitmap?.recycle()
-            pendingFrame.getAndSet(null)?.release()
-            inferenceInFlight.set(false)
-            if (isResultGenerationCurrent(frameResultGeneration)) {
-                notifyError(error)
-            }
+            if (!submittedToNative) ownedFrame?.allowReleaseAfterNativeCompletion()
+            // detectAsync can throw after submission has started. Do not infer that the native
+            // consumer has stopped using its input; successful close or exact completion must fence it.
+            failAndClose(error)
         } finally {
+            ownedFrame?.let { frame ->
+                frame.finishSubmission()
+                releaseFrameIfSafe(frame)
+            } ?: inferenceInFlight.set(false)
             if (!proxyClosed) {
-                proxyClosed = true
                 closeProxySafely(imageProxy)
             }
         }
     }
 
-    private fun handleResult(result: FaceLandmarkerResult) {
-        val frame = pendingFrame.get() ?: return
-        // A late callback must never consume a newer frame's resources.
-        if (result.timestampMs() != frame.timestampMs) {
-            // Never release or replace the currently pending frame for a stale callback.
-            // The controller's error fallback closes this provider and releases its own frame.
-            val error = IllegalStateException(
-                "MediaPipe result timestamp mismatch: result=${result.timestampMs()}, pending=${frame.timestampMs}"
-            )
-            Log.w(TAG, "Ignoring stale result callback", error)
-            if (isResultGenerationCurrent(frame.resultGeneration)) {
-                notifyError(error)
-            }
-            return
+    /** Analyzer may skip submission while no exact transform exists; still expose real input. */
+    internal fun recordTransformRejectedFrame(imageProxy: ImageProxy, sessionGeneration: Long?) {
+        if (!BuildConfig.DEBUG) return
+        droppedFrames.incrementAndGet()
+        val now = SystemClock.uptimeMillis()
+        if (rejectedFrameSampleLimiter.shouldReport(now)) {
+            val crop = imageProxy.cropRect
+            frameDiagnostics.set(MediaPipeFrameDiagnostics(
+                imageProxy.width, imageProxy.height, crop.left, crop.top, crop.right, crop.bottom,
+                imageProxy.imageInfo.rotationDegrees, 0, 0, now, sessionGeneration
+            ))
         }
-        if (!pendingFrame.compareAndSet(frame, null)) return
+        logDiagnosticsIfDue()
+    }
+
+    private fun recordDroppedFrame() {
+        if (!BuildConfig.DEBUG) return
+        droppedFrames.incrementAndGet()
+        logDiagnosticsIfDue()
+    }
+
+    private fun logDiagnosticsIfDue() {
+        if (!BuildConfig.DEBUG || !diagnosticLogLimiter.shouldReport(SystemClock.uptimeMillis())) return
+        val frame = frameDiagnostics.get()
+        Log.d(TAG, "frame=$frame inFlight=${inferenceInFlight.get()} dropped=${droppedFrames.get()} " +
+            "watchdog=${_watchdogStatus.get()} shutdownComplete=${shutdownComplete.get()}")
+    }
+
+    private fun handleResult(result: FaceLandmarkerResult, callbackImage: MPImage?) {
+        try {
+            handleGeometryResult(result)
+        } finally {
+            // MediaPipe 1.1.1 FaceLandmarker$1.convertToTaskInput creates a NEW bitmap-backed
+            // MPImage. OutputHandler.run does not close it. It is not the native-owned input.
+            try { callbackImage?.close() } catch (error: Exception) {
+                Log.w(TAG, "MediaPipe callback image close failed", error)
+            }
+        }
+    }
+
+    private fun handleGeometryResult(result: FaceLandmarkerResult) {
+        val frame = synchronized(submissionLock) {
+            val pending = pendingFrame.get() ?: return
+            // Duplicate/late callbacks cannot consume another inference's input or cancel its timer.
+            if (result.timestampMs() != pending.timestampMs || pending.completionStarted) return
+            pending.completionStarted = true
+            pending
+        }
+        frame.cancelWatchdog()
 
         try {
-            if (closed.get()) return
+            if (!isFrameCurrent(frame)) return
 
             val faceLandmarks = result.faceLandmarks().firstOrNull()
             if (faceLandmarks.isNullOrEmpty()) {
@@ -248,21 +389,58 @@ class MediaPipeFaceGeometryProvider(
                 )
             )
         } catch (error: Exception) {
-            if (isResultGenerationCurrent(frame.resultGeneration)) {
-                notifyError(error)
-            }
+            if (isFrameCurrent(frame)) failAndClose(error)
         } finally {
-            frame.release()
-            inferenceInFlight.set(false)
+            frame.allowReleaseAfterNativeCompletion()
+            releaseFrameIfSafe(frame)
         }
     }
 
     private fun handleError(error: RuntimeException) {
-        val frame = pendingFrame.getAndSet(null)
-        frame?.release()
-        inferenceInFlight.set(false)
-        if (frame == null || isResultGenerationCurrent(frame.resultGeneration)) {
-            notifyError(error)
+        if (shutdownStarted.get()) {
+            // TaskRunner.close() reports wait/tearDown errors to ErrorListener and can still
+            // return normally. A normal Java return alone is not proof that teardown succeeded.
+            shutdownFailureObserved.set(true)
+            if (shutdownErrorLogged.compareAndSet(false, true)) {
+                Log.w(TAG, "MediaPipe reported a native shutdown failure", error)
+            }
+            return
+        }
+        // Error callbacks carry no input timestamp and are not a completion fence. Retain the
+        // pending image until the exact result arrives or graph shutdown succeeds.
+        failAndClose(error)
+    }
+
+    private fun handleInferenceTimeout(frame: PendingFrame) {
+        val timedOut = synchronized(submissionLock) {
+            if (pendingFrame.get() !== frame || frame.completionStarted || closed.get()) {
+                false
+            } else {
+                closed.set(true)
+                _watchdogStatus.set(InferenceWatchdogStatus.TIMED_OUT)
+                true
+            }
+        }
+        if (!timedOut) return
+        // Stop this task permanently. Never reopen the single-in-flight gate on a stuck landmarker.
+        close()
+        notifyError(MediaPipeInferenceTimeoutException(frame.timestampMs, frame.displayTransform?.session?.generation))
+    }
+
+    private fun failAndClose(error: Throwable) {
+        val failed = synchronized(submissionLock) { closed.compareAndSet(false, true) }
+        if (!failed) return
+        close()
+        notifyError(error)
+    }
+
+    private fun releaseFrameIfSafe(frame: PendingFrame) {
+        if (!frame.releaseIfSafe()) return
+        synchronized(submissionLock) {
+            if (pendingFrame.compareAndSet(frame, null) || pendingFrame.get() == null) {
+                inferenceInFlight.set(false)
+                if (!closed.get()) _watchdogStatus.set(InferenceWatchdogStatus.IDLE)
+            }
         }
     }
 
@@ -270,24 +448,36 @@ class MediaPipeFaceGeometryProvider(
         frame: PendingFrame,
         snapshot: FaceGeometrySnapshot?
     ) {
-        val listener = synchronized(resultGenerationLock) {
-            if (closed.get() || frame.resultGeneration != resultGeneration) return
-            resultListener.get()
-        }
+        if (!isFrameCurrent(frame)) return
         try {
-            listener.invoke(snapshot, frame.displayTransform)
+            val sessionListener = sessionResultListener.get()
+            if (sessionListener != null) {
+                sessionListener.invoke(snapshot, frame.displayTransform, frame.timestampMs)
+            } else {
+                resultListener.get().invoke(snapshot, frame.displayTransform)
+            }
         } catch (error: Exception) {
             Log.e(TAG, "Face geometry result listener threw an exception", error)
         }
     }
 
-    private fun isResultGenerationCurrent(generation: Long): Boolean =
-        synchronized(resultGenerationLock) { generation == resultGeneration }
+    private fun isFrameCurrent(frame: PendingFrame): Boolean =
+        !closed.get() && frame.displayTransform?.session?.isCurrent != false
 
     private fun notifyError(error: Throwable) {
-        Log.e(TAG, "Face geometry provider failed", error)
+        if (pendingError.compareAndSet(null, error)) {
+            Log.e(TAG, "Face geometry provider failed", error)
+        }
+        deliverPendingError()
+    }
+
+    /** A native initialization callback can fail before the controller attaches its listener. */
+    private fun deliverPendingError() {
+        val error = pendingError.get() ?: return
+        val listener = errorListener.get() ?: return
+        if (!errorDelivered.compareAndSet(false, true)) return
         try {
-            errorListener.get()?.invoke(error)
+            listener(error)
         } catch (listenerError: Exception) {
             Log.e(TAG, "Face geometry error listener threw an exception", listenerError)
         }
@@ -410,22 +600,49 @@ class MediaPipeFaceGeometryProvider(
         }
     }
 
+    /**
+     * Retires immediately, then drains native work off CameraX's executor. MediaPipe 1.1.1's
+     * TaskRunner.close() waitsUntilGraphDone and has no bounded shutdown guarantee. If it blocks
+     * or throws, the input remains owned; only an exact late completion can then release it.
+     */
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
-
+        val frame = synchronized(submissionLock) {
+            closed.set(true)
+            if (!shutdownStarted.compareAndSet(false, true)) return
+            if (_watchdogStatus.get() != InferenceWatchdogStatus.TIMED_OUT) {
+                _watchdogStatus.set(InferenceWatchdogStatus.CLOSED)
+            }
+            pendingFrame.get()
+        }
+        frame?.cancelWatchdog()
+        watchdogScheduler.close()
         try {
-            landmarker.close()
+            shutdownExecutor.execute {
+                try {
+                    // Initialization can itself report an error. Never close a handle before
+                    // createFromOptions has returned it, or lose an early error before subscription.
+                    initializationFinished.await()
+                    val task = landmarker.get() ?: return@execute
+                    frame?.awaitSubmissionFinished()
+                    task.close()
+                    if (!shutdownFailureObserved.get()) {
+                        frame?.let {
+                            it.allowReleaseAfterNativeCompletion()
+                            releaseFrameIfSafe(it)
+                        }
+                        shutdownComplete.set(true)
+                    }
+                } catch (error: Exception) {
+                    Log.w(TAG, "MediaPipe close did not confirm shutdown; retaining any native-owned input", error)
+                }
+            }
         } catch (error: Exception) {
-            Log.w(TAG, "MediaPipe FaceLandmarker close failed", error)
-        } finally {
-            pendingFrame.getAndSet(null)?.release()
-            inferenceInFlight.set(false)
+            Log.w(TAG, "Could not schedule MediaPipe shutdown; retaining any native-owned input", error)
         }
     }
 
     private class PendingFrame(
         val timestampMs: Long,
-        val resultGeneration: Long,
         val imageWidth: Int,
         val imageHeight: Int,
         val rotationDegrees: Int,
@@ -434,21 +651,43 @@ class MediaPipeFaceGeometryProvider(
         val bitmap: Bitmap,
         val mpImage: MPImage
     ) {
+        // completionStarted is protected by the provider's submissionLock.
+        var completionStarted = false
+        private val submissionFinished = CountDownLatch(1)
+        private val nativeCompletionConfirmed = AtomicBoolean(false)
+        private val watchdogHandle = AtomicReference<AutoCloseable?>(null)
+        private val watchdogCancelled = AtomicBoolean(false)
         private val released = AtomicBoolean(false)
 
-        fun release() {
-            if (!released.compareAndSet(false, true)) return
+        fun attachWatchdog(handle: AutoCloseable) {
+            watchdogHandle.set(handle)
+            if (watchdogCancelled.get()) cancelWatchdog()
+        }
 
+        fun cancelWatchdog() {
+            watchdogCancelled.set(true)
+            watchdogHandle.getAndSet(null)?.close()
+        }
+        fun finishSubmission() { submissionFinished.countDown() }
+        fun awaitSubmissionFinished() { submissionFinished.await() }
+        fun allowReleaseAfterNativeCompletion() { nativeCompletionConfirmed.set(true) }
+
+        fun releaseIfSafe(): Boolean {
+            if (!nativeCompletionConfirmed.get() || submissionFinished.count != 0L ||
+                !released.compareAndSet(false, true)
+            ) return false
+            cancelWatchdog()
             try {
-                mpImage.close()
+                mpImage.close() // BitmapImageContainer owns/recycles the inference bitmap.
             } catch (_: Exception) {
-                // Best effort cleanup after inference completes or provider closes.
+                // Best effort cleanup after native use is confirmed to be over.
             }
             try {
                 if (!bitmap.isRecycled) bitmap.recycle()
             } catch (_: Exception) {
                 // Best effort cleanup.
             }
+            return true
         }
     }
 
@@ -456,5 +695,29 @@ class MediaPipeFaceGeometryProvider(
         private const val TAG = "MediaPipeFaceGeometry"
         private const val DEFAULT_MODEL_ASSET = "face_landmarker.task"
         private const val DEFAULT_CONFIDENCE = 0.5f
+        // Completion policy is 12x the renderer's 250ms freshness cutoff: allow a generous
+        // startup/CPU/scheduling margin, but never leave the single-in-flight gate stuck forever.
+        // This is a safety deadline, not a claimed device-specific inference latency guarantee.
+        internal const val INFERENCE_COMPLETION_TIMEOUT_MS = 3_000L
+
+        private val DEFAULT_TASK_FACTORY = AsyncFaceLandmarkerTaskFactory { context, asset, onResult, onError ->
+            val options = FaceLandmarker.FaceLandmarkerOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(asset).setDelegate(Delegate.CPU).build())
+                .setRunningMode(RunningMode.LIVE_STREAM)
+                .setNumFaces(1)
+                .setMinFaceDetectionConfidence(DEFAULT_CONFIDENCE)
+                .setMinFacePresenceConfidence(DEFAULT_CONFIDENCE)
+                .setMinTrackingConfidence(DEFAULT_CONFIDENCE)
+                .setOutputFaceBlendshapes(true)
+                .setOutputFacialTransformationMatrixes(true)
+                .setResultListener { result, image -> onResult(result, image) }
+                .setErrorListener { error -> onError(error) }
+                .build()
+            val task = FaceLandmarker.createFromOptions(context, options)
+            object : AsyncFaceLandmarkerTask {
+                override fun detectAsync(image: MPImage, timestampMs: Long) = task.detectAsync(image, timestampMs)
+                override fun close() = task.close()
+            }
+        }
     }
 }

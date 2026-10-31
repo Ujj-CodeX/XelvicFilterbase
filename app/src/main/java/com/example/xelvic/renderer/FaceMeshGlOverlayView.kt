@@ -12,10 +12,12 @@ import android.util.Log
 import com.example.xelvic.geometry.FaceGeometryRenderFrame
 import com.example.xelvic.geometry.FaceMeshTessellation
 import com.example.xelvic.geometry.FaceMeshUvMap
+import com.example.xelvic.perf.DiagnosticRateLimiter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -40,6 +42,14 @@ enum class FaceMeshGlRenderStatus {
     TEXTURE_UPLOAD_FAILED,
     GL_DRAW_FAILED
 }
+
+data class FaceMeshGlSurfaceDiagnostics(
+    val surfaceWidth: Int = 0,
+    val surfaceHeight: Int = 0,
+    val viewWidth: Int = 0,
+    val viewHeight: Int = 0,
+    val boundsInWindow: String? = null
+)
 
 internal const val DIAGNOSTIC_FACE_SPACE_UV_LAYOUT_ID = "diagnostic_face_space_v1"
 internal const val DIAGNOSTIC_MOUSTACHE_FILTER_ID = "moustache_mesh_test"
@@ -91,6 +101,75 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
 ) : GLSurfaceView(context, attrs) {
 
     private val meshRenderer = FaceMeshGlRenderer()
+    private val framePublicationLock = Any()
+    private val renderDiagnosticListener = AtomicReference<((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?>(null)
+    private var glPaused = false
+    @Volatile private var viewReleased = false
+    @Volatile private var windowDetached = false
+    private val diagnosticDeliveryGeneration = AtomicLong(0L)
+    private val surfaceDiagnostics = AtomicReference(FaceMeshGlSurfaceDiagnostics())
+    private val surfaceDiagnosticListener = AtomicReference<((FaceMeshGlSurfaceDiagnostics) -> Unit)?>(null)
+    private val surfaceDiagnosticLogLimiter = DiagnosticRateLimiter(1_000L)
+
+    init {
+        if (BuildConfig.DEBUG) {
+            meshRenderer.onSurfaceSizeChanged = { width, height ->
+                updateSurfaceDiagnostics { it.copy(surfaceWidth = width, surfaceHeight = height) }
+            }
+        }
+    }
+
+    fun setSurfaceDiagnosticsListener(listener: ((FaceMeshGlSurfaceDiagnostics) -> Unit)?) {
+        if (!BuildConfig.DEBUG || (viewReleased && listener != null)) return
+        surfaceDiagnosticListener.set(listener)
+        val current = surfaceDiagnostics.get()
+        postSurfaceDiagnostics(listener, current)
+    }
+
+    private fun updateSurfaceDiagnostics(update: (FaceMeshGlSurfaceDiagnostics) -> FaceMeshGlSurfaceDiagnostics) {
+        while (true) {
+            val previous = surfaceDiagnostics.get()
+            val next = update(previous)
+            if (next == previous) return
+            if (surfaceDiagnostics.compareAndSet(previous, next)) {
+                postSurfaceDiagnostics(surfaceDiagnosticListener.get(), next)
+                if (surfaceDiagnosticLogLimiter.shouldReport(SystemClock.uptimeMillis())) {
+                    Log.d("FaceMeshGlOverlay", "surface=${next.surfaceWidth}x${next.surfaceHeight} " +
+                        "view=${next.viewWidth}x${next.viewHeight} bounds=${next.boundsInWindow}")
+                }
+                return
+            }
+        }
+    }
+
+    private fun postSurfaceDiagnostics(
+        listener: ((FaceMeshGlSurfaceDiagnostics) -> Unit)?,
+        diagnostics: FaceMeshGlSurfaceDiagnostics
+    ) {
+        if (listener == null) return
+        val generation = diagnosticDeliveryGeneration.get()
+        post {
+            if (!viewReleased && !windowDetached && diagnosticDeliveryGeneration.get() == generation &&
+                surfaceDiagnosticListener.get() === listener && surfaceDiagnostics.get() == diagnostics
+            ) {
+                try { listener(diagnostics) } catch (error: Exception) {
+                    Log.w("FaceMeshGlOverlay", "Surface diagnostics listener failed", error)
+                }
+            }
+        }
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        if (BuildConfig.DEBUG) {
+            val location = IntArray(2)
+            getLocationInWindow(location)
+            updateSurfaceDiagnostics { it.copy(
+                viewWidth = width, viewHeight = height,
+                boundsInWindow = "[${location[0]},${location[1]}..${location[0] + width},${location[1] + height}]"
+            ) }
+        }
+    }
 
     @Volatile
     private var attachedHolder: FaceGeometrySnapshotHolder? = null
@@ -99,36 +178,102 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
     private var snapshotListenerHandle: AutoCloseable? = null
 
     fun setSnapshotHolder(next: FaceGeometrySnapshotHolder?) {
+        if (viewReleased && next != null) return
         if (attachedHolder === next) {
-            publishFrame(next?.getLatest())
+            publishHolderFrameIfCurrent(next)
             return
         }
 
         snapshotListenerHandle?.close()
         snapshotListenerHandle = null
-        attachedHolder = next
+        synchronized(framePublicationLock) { attachedHolder = next }
 
-        if (next != null) {
-            // Subscribe before reading the current frame so an update published while this
-            // holder is being attached cannot fall into a read-before-subscribe race.
-            snapshotListenerHandle = next.addSnapshotListener {
-                if (attachedHolder === next) {
-                    publishFrame(next.getLatest())
-                }
-            }
+        if (next != null && !windowDetached) {
+            // Subscribe before reading so attach cannot miss an already completed inference.
+            snapshotListenerHandle = next.addSnapshotListener { publishHolderFrameIfCurrent(next) }
         }
-
-        // This read also covers a frame published immediately before subscription completed.
-        publishFrame(next?.getLatest())
+        publishHolderFrameIfCurrent(next)
     }
 
-    override fun onDetachedFromWindow() {
+    /** Check + handoff share one ordering point with holder detach/replacement. */
+    private fun publishHolderFrameIfCurrent(expected: FaceGeometrySnapshotHolder?) {
+        val frame = synchronized(framePublicationLock) {
+            if (((viewReleased || windowDetached) && expected != null) || attachedHolder !== expected) return
+            expected?.getLatest().also(meshRenderer::publishFrame)
+        }
+        requestRender()
+        if (frame != null) scheduleStaleFrameClear(frame.snapshot.timestampMs)
+    }
+
+    /** Idempotent UI-thread pause/resume; GLSurfaceView starts its thread when setRenderer is called. */
+    fun setHostResumed(resumed: Boolean) {
+        if (viewReleased) return
+        if (windowDetached) {
+            glPaused = !resumed
+            return
+        }
+        if (resumed) onResume() else onPause()
+    }
+
+    override fun onResume() {
+        if (viewReleased || !glPaused) return
+        glPaused = false
+        super.onResume()
+        requestRender()
+    }
+
+    override fun onPause() {
+        if (glPaused) return
+        glPaused = true
+        super.onPause()
+    }
+
+    /** Final AndroidView release, not merely an Activity/lifecycle-owner pause. */
+    fun releaseOverlay() {
+        if (viewReleased) return
+        viewReleased = true
         setSnapshotHolder(null)
         setEffect(null)
         setDiagnosticsListener(null)
-        // Ensure GL-owned texture deletion runs before GLSurfaceView stops its render thread.
-        requestRender()
+        setSurfaceDiagnosticsListener(null)
+        // A dirty draw is not guaranteed before pause/detach. Do not retain an EGL context for a
+        // released view: GLSurfaceView owns its destruction (which frees textures AND programs).
+        setPreserveEGLContextOnPause(false)
+        onPause()
+        // If an earlier Activity pause already preserved the context, final detach destroys it.
+    }
+
+    override fun onDetachedFromWindow() {
+        diagnosticDeliveryGeneration.incrementAndGet()
+        synchronized(framePublicationLock) {
+            windowDetached = true
+            meshRenderer.publishFrame(null)
+        }
+        snapshotListenerHandle?.close()
+        snapshotListenerHandle = null
+        // GLSurfaceView stops its thread and destroys the context even if an earlier pause
+        // preserved it. Keep caller-owned effect/holder selection for a transient reattach.
+        if (BuildConfig.DEBUG) {
+            updateSurfaceDiagnostics { it.copy(surfaceWidth = 0, surfaceHeight = 0) }
+        }
         super.onDetachedFromWindow()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (viewReleased) return
+        windowDetached = false
+        // A reattached GLSurfaceView starts a NEW, initially unpaused render thread.
+        if (glPaused) {
+            glPaused = false
+            onPause()
+        }
+        attachedHolder?.let { next ->
+            if (snapshotListenerHandle == null) {
+                snapshotListenerHandle = next.addSnapshotListener { publishHolderFrameIfCurrent(next) }
+            }
+        }
+        publishHolderFrameIfCurrent(attachedHolder)
     }
 
     init {
@@ -144,7 +289,9 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
 
     /** Publish the latest immutable geometry/transform pair. Safe from a MediaPipe callback. */
     fun publishFrame(frame: FaceGeometryRenderFrame?) {
-        meshRenderer.publishFrame(frame)
+        synchronized(framePublicationLock) {
+            meshRenderer.publishFrame(if (viewReleased) null else frame)
+        }
         requestRender()
         if (frame != null) {
             scheduleStaleFrameClear(frame.snapshot.timestampMs)
@@ -167,7 +314,7 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
 
     /** Select or clear an effect without recreating the tracking provider. */
     fun setEffect(effect: FaceMeshGlEffect?) {
-        meshRenderer.setEffect(effect)
+        meshRenderer.setEffect(if (viewReleased) null else effect)
         requestRender()
     }
 
@@ -181,7 +328,20 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
     fun setDiagnosticsListener(
         listener: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?
     ) {
-        meshRenderer.setDiagnosticsListener(listener)
+        if (viewReleased && listener != null) return
+        renderDiagnosticListener.set(listener)
+        meshRenderer.setDiagnosticsListener(if (listener == null) null else { status, decision ->
+            val generation = diagnosticDeliveryGeneration.get()
+            post {
+                if (!viewReleased && !windowDetached && diagnosticDeliveryGeneration.get() == generation &&
+                    renderDiagnosticListener.get() === listener && meshRenderer.isCurrentRenderStatus(status, decision)
+                ) {
+                    try { listener(status, decision) } catch (error: Exception) {
+                        Log.w("FaceMeshGlOverlay", "Render diagnostics listener failed", error)
+                    }
+                }
+            }
+        })
     }
 
     private companion object {
@@ -189,7 +349,8 @@ class FaceMeshGlOverlayView @JvmOverloads constructor(
     }
 }
 
-private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
+internal class FaceMeshGlRenderer : GLSurfaceView.Renderer {
+    var onSurfaceSizeChanged: ((Int, Int) -> Unit)? = null
     private val latestFrame = AtomicReference<FaceGeometryRenderFrame?>(null)
     private val selectedEffect = AtomicReference<FaceMeshGlEffect?>(null)
 
@@ -200,30 +361,34 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
     )
         private set
 
-    @Volatile
-    var lastRenderStatus: FaceMeshGlRenderStatus = FaceMeshGlRenderStatus.WAITING_FOR_SURFACE
-        private set
+    private data class RenderStatus(val status: FaceMeshGlRenderStatus, val decision: RenderBackendDecision)
+    private val renderStatus = AtomicReference(RenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_SURFACE, lastDecision))
+    val lastRenderStatus: FaceMeshGlRenderStatus get() = renderStatus.get().status
 
-    @Volatile
-    private var diagnosticsListener:
-        ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)? = null
-
-    private var lastPublishedDecision: RenderBackendDecision? = null
+    private val diagnosticsListener =
+        AtomicReference<((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?>(null)
 
     fun setDiagnosticsListener(
         listener: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)?
     ) {
-        diagnosticsListener = listener
-        listener?.invoke(lastRenderStatus, lastDecision)
-        lastPublishedDecision = lastDecision
+        diagnosticsListener.set(listener)
+        val current = renderStatus.get()
+        try { listener?.invoke(current.status, current.decision) } catch (error: Exception) {
+            Log.w(TAG, "Render diagnostics listener failed", error)
+        }
+    }
+
+    fun isCurrentRenderStatus(status: FaceMeshGlRenderStatus, decision: RenderBackendDecision): Boolean {
+        val current = renderStatus.get()
+        return current.status == status && current.decision == decision
     }
 
     private fun publishRenderStatus(status: FaceMeshGlRenderStatus) {
-        val decision = lastDecision
-        if (status == lastRenderStatus && decision == lastPublishedDecision) return
-        lastRenderStatus = status
-        lastPublishedDecision = decision
-        diagnosticsListener?.invoke(status, decision)
+        val next = RenderStatus(status, lastDecision)
+        if (renderStatus.getAndSet(next) == next) return
+        try { diagnosticsListener.get()?.invoke(status, next.decision) } catch (error: Exception) {
+            Log.w(TAG, "Render diagnostics listener failed", error)
+        }
     }
 
     private var surfaceWidth = 0
@@ -237,6 +402,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
     private var attemptedEffect: FaceMeshGlEffect? = null
     private var uploadedEffect: FaceMeshGlEffect? = null
     private var maxTextureSize = 0
+    private val drawErrorLogLimiter = DiagnosticRateLimiter(1_000L)
 
     // All CPU-side buffers are allocated once and reused on the GL thread.
     private val positions = FloatArray(FaceMeshTessellation.LANDMARK_COUNT * 2)
@@ -262,6 +428,18 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // onSurfaceCreated means a NEW context. Old numeric handles must be forgotten, never
+        // deleted in this context where those IDs may already name unrelated objects.
+        textureId = 0
+        attemptedEffect = null
+        uploadedEffect = null
+        program = 0
+        positionHandle = -1
+        uvHandle = -1
+        textureHandle = -1
+        opacityHandle = -1
+        lastDecision = blocked(RenderBackendBlockReason.MESH_REQUIREMENTS_MISSING)
+        onSurfaceSizeChanged?.invoke(0, 0)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glDisable(GLES20.GL_CULL_FACE)
@@ -285,14 +463,12 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         } else {
             publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_FRAME)
         }
-        textureId = 0
-        attemptedEffect = null
-        uploadedEffect = null
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         surfaceWidth = width
         surfaceHeight = height
+        onSurfaceSizeChanged?.invoke(width, height)
         GLES20.glViewport(0, 0, width, height)
         if (width <= 0 || height <= 0) {
             publishRenderStatus(FaceMeshGlRenderStatus.WAITING_FOR_SURFACE)
@@ -349,7 +525,7 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
             return
         }
         val frameAgeMs = SystemClock.uptimeMillis() - frame.snapshot.timestampMs
-        if (frameAgeMs < 0L || frameAgeMs > MAX_FRAME_AGE_MS) {
+        if (!frame.isCurrent || frameAgeMs < 0L || frameAgeMs > MAX_FRAME_AGE_MS) {
             latestFrame.compareAndSet(frame, null)
             publishRenderStatus(FaceMeshGlRenderStatus.STALE_FRAME)
             return
@@ -380,6 +556,11 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         uvBuffer.put(uvs)
         uvBuffer.position(0)
 
+        // Invalidation may retire a prepared frame while CPU buffers are being filled.
+        if (!frame.isCurrent) {
+            publishRenderStatus(FaceMeshGlRenderStatus.STALE_FRAME)
+            return
+        }
         GLES20.glUseProgram(program)
         GLES20.glEnableVertexAttribArray(positionHandle)
         GLES20.glEnableVertexAttribArray(uvHandle)
@@ -402,7 +583,9 @@ private class FaceMeshGlRenderer : GLSurfaceView.Renderer {
         if (drawError == GLES20.GL_NO_ERROR) {
             publishRenderStatus(FaceMeshGlRenderStatus.DRAWN)
         } else {
-            Log.e(TAG, "Face mesh draw failed with GL error 0x${Integer.toHexString(drawError)}")
+            if (drawErrorLogLimiter.shouldReport(SystemClock.uptimeMillis())) {
+                Log.e(TAG, "Face mesh draw failed with GL error 0x${Integer.toHexString(drawError)}")
+            }
             publishRenderStatus(FaceMeshGlRenderStatus.GL_DRAW_FAILED)
         }
     }

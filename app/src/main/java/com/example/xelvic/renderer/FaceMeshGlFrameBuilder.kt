@@ -27,7 +27,7 @@ object FaceMeshGlFrameBuilder {
         mappedPoint: FloatArray,
         uvMode: FaceMeshTextureUvMode = FaceMeshTextureUvMode.PINNED_CANONICAL
     ): Boolean {
-        if (renderFrame == null || viewWidth <= 0 || viewHeight <= 0) return false
+        if (renderFrame == null || !renderFrame.isCurrent || viewWidth <= 0 || viewHeight <= 0) return false
         if (requiredTopologyId != FaceMeshTessellation.TOPOLOGY_ID) return false
         if (requiredModelAssetSha256.length != 64 ||
             !requiredModelAssetSha256.all { it in '0'..'9' || it in 'a'..'f' }

@@ -3,6 +3,7 @@ package com.example.xelvic.ui
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
@@ -12,6 +13,7 @@ import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.renderer.FaceMeshGlEffect
 import com.example.xelvic.renderer.FaceMeshGlOverlayView
 import com.example.xelvic.renderer.FaceMeshGlRenderStatus
+import com.example.xelvic.renderer.FaceMeshGlSurfaceDiagnostics
 import com.example.xelvic.renderer.RenderBackendDecision
 
 /**
@@ -24,35 +26,38 @@ internal fun FaceMeshTextureOverlay(
     effect: FaceMeshGlEffect?,
     enabled: Boolean,
     modifier: Modifier = Modifier,
-    onRenderStatus: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)? = null
+    onRenderStatus: ((FaceMeshGlRenderStatus, RenderBackendDecision) -> Unit)? = null,
+    onSurfaceDiagnostics: ((FaceMeshGlSurfaceDiagnostics) -> Unit)? = null
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val viewRef = remember { arrayOfNulls<FaceMeshGlOverlayView>(1) }
+    val currentRenderStatus = rememberUpdatedState(onRenderStatus)
+    val currentSurfaceDiagnostics = rememberUpdatedState(onSurfaceDiagnostics)
 
     AndroidView(
         factory = { context ->
             FaceMeshGlOverlayView(context).also { view ->
                 viewRef[0] = view
-                // This GL view may be created after Activity is already RESUMED.
-                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                    view.onResume()
+                // The renderer thread starts immediately; also pause a view mounted while the
+                // host is below RESUMED. Callbacks are main-thread/lifetime fenced by the view.
+                view.setHostResumed(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                view.setDiagnosticsListener { status, decision ->
+                    currentRenderStatus.value?.invoke(status, decision)
+                }
+                view.setSurfaceDiagnosticsListener { diagnostics ->
+                    currentSurfaceDiagnostics.value?.invoke(diagnostics)
                 }
             }
         },
         update = { view ->
             viewRef[0] = view
-            view.setDiagnosticsListener { status, decision ->
-                view.post { onRenderStatus?.invoke(status, decision) }
-            }
+            view.setHostResumed(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
             view.setSnapshotHolder(if (enabled) holder else null)
             view.setEffect(if (enabled) effect else null)
         },
         modifier = modifier,
         onRelease = { view ->
-            view.setDiagnosticsListener(null)
-            view.setSnapshotHolder(null)
-            view.setEffect(null)
-            view.onPause()
+            view.releaseOverlay()
             if (viewRef[0] === view) {
                 viewRef[0] = null
             }
@@ -63,19 +68,20 @@ internal fun FaceMeshTextureOverlay(
         val observer = LifecycleEventObserver { _, event ->
             val view = viewRef[0] ?: return@LifecycleEventObserver
             when (event) {
-                Lifecycle.Event.ON_RESUME -> view.onResume()
-                Lifecycle.Event.ON_PAUSE -> view.onPause()
+                Lifecycle.Event.ON_RESUME -> view.setHostResumed(true)
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP, Lifecycle.Event.ON_DESTROY ->
+                    view.setHostResumed(false)
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
+        viewRef[0]?.setHostResumed(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
 
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            viewRef[0]?.setDiagnosticsListener(null)
-            viewRef[0]?.setSnapshotHolder(null)
-            viewRef[0]?.setEffect(null)
-            viewRef[0]?.onPause()
+            // An owner replacement is not AndroidView release. Keep holder/effect/listeners so
+            // the replacement RESUMED owner can resume the same view without losing its texture.
+            viewRef[0]?.setHostResumed(false)
         }
     }
 }

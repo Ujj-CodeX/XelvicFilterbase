@@ -1,5 +1,7 @@
 package com.example.xelvic.ui
 
+import android.os.SystemClock
+import android.util.Log
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.camera.view.PreviewView
@@ -68,6 +70,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
+import com.example.BuildConfig
+import com.example.xelvic.camera.CameraGeometryDiagnostics
+import com.example.xelvic.perf.DiagnosticRateLimiter
 import com.example.xelvic.camera.CameraController
 import com.example.xelvic.camera.FlashMode
 import com.example.xelvic.model.FaceTrackingResult
@@ -80,6 +85,8 @@ import com.example.xelvic.renderer.FaceMeshEffectBlockReason
 import com.example.xelvic.renderer.FaceMeshEffectResolution
 import com.example.xelvic.renderer.FaceMeshEffectResolver
 import com.example.xelvic.renderer.FaceMeshGlRenderStatus
+import com.example.xelvic.renderer.FaceMeshGlSurfaceDiagnostics
+import kotlinx.coroutines.delay
 import com.example.xelvic.renderer.RenderBackendDecision
 import com.example.xelvic.renderer.RenderBackend
 import com.example.xelvic.renderer.RenderBackendBlockReason
@@ -112,6 +119,20 @@ fun CameraScreen(
     var meshGlRenderStatus by remember {
         mutableStateOf(FaceMeshGlRenderStatus.NOT_MOUNTED)
     }
+    var meshGlSurfaceDiagnostics by remember { mutableStateOf<FaceMeshGlSurfaceDiagnostics?>(null) }
+    var geometryDiagnostics by remember { mutableStateOf<CameraGeometryDiagnostics?>(null) }
+    val meshDiagnosticLogLimiter = remember { DiagnosticRateLimiter(1_000L) }
+    LaunchedEffect(showDebugOverlay, cameraController) {
+        if (BuildConfig.DEBUG && showDebugOverlay) {
+            while (true) {
+                geometryDiagnostics = cameraController.debugGeometryDiagnostics(SystemClock.uptimeMillis())
+                delay(500L) // Debug UI sampling only; never refreshes transforms or drives rendering.
+            }
+        } else {
+            geometryDiagnostics = null
+        }
+    }
+
     var meshBackendDecision by remember {
         mutableStateOf(
             RenderBackendDecision(
@@ -181,9 +202,20 @@ fun CameraScreen(
     val activeMeshEffect =
         (meshEffectResolution as? FaceMeshEffectResolution.Ready)?.effect
 
-    LaunchedEffect(isMeshTextureSelected, activeMeshEffect) {
-        if (!isMeshTextureSelected || activeMeshEffect == null) {
+    LaunchedEffect(isMeshTextureSelected, activeMeshEffect, isMediaPipeGeometryEnabled) {
+        if (!isMeshTextureSelected || activeMeshEffect == null || !isMediaPipeGeometryEnabled) {
             meshGlRenderStatus = FaceMeshGlRenderStatus.NOT_MOUNTED
+            meshGlSurfaceDiagnostics = null
+        }
+    }
+
+    LaunchedEffect(meshGlRenderStatus, meshEffectResolution, isMediaPipeGeometryEnabled) {
+        if (BuildConfig.DEBUG && meshGlRenderStatus == FaceMeshGlRenderStatus.NOT_MOUNTED &&
+            meshDiagnosticLogLimiter.shouldReport(SystemClock.uptimeMillis())
+        ) {
+            val resolver = (meshEffectResolution as? FaceMeshEffectResolution.Blocked)?.reason
+                ?: meshEffectResolution.javaClass.simpleName
+            Log.d("FaceMeshGlOverlay", "NOT_MOUNTED resolver=$resolver geometryEnabled=$isMediaPipeGeometryEnabled")
         }
     }
 
@@ -244,11 +276,14 @@ fun CameraScreen(
                 onRenderStatus = { status, decision ->
                     meshGlRenderStatus = status
                     meshBackendDecision = decision
-                }
+                },
+                onSurfaceDiagnostics = if (BuildConfig.DEBUG) { diagnostics ->
+                    meshGlSurfaceDiagnostics = diagnostics
+                } else null
             )
         }
 
-        if (showDebugOverlay) {
+        if (BuildConfig.DEBUG && showDebugOverlay) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
@@ -272,10 +307,34 @@ fun CameraScreen(
                         fontSize = 10.sp
                     )
                     Text(
-                        "Output transform: ${previewDiagnostics.outputTransformAvailable} · ${previewDiagnostics.geometryTransformStatus}",
+                        "Output transform: ${previewDiagnostics.outputTransformAvailable} · ${previewDiagnostics.geometryTransformStatus} · gen=${previewDiagnostics.configurationGeneration}",
                         color = Color.White,
                         fontSize = 10.sp
                     )
+                    geometryDiagnostics?.let { diagnostics ->
+                        diagnostics.frame?.let { frame ->
+                            Text(
+                                "ImageProxy: ${frame.sourceWidth}×${frame.sourceHeight} crop=[${frame.cropLeft},${frame.cropTop}..${frame.cropRight},${frame.cropBottom}] rot=${frame.rotationDegrees}",
+                                color = Color.White,
+                                fontSize = 9.sp
+                            )
+                            Text(
+                                "Upright: ${frame.inferenceWidth}×${frame.inferenceHeight} · frame=${frame.timestampMs} · session=${frame.geometrySessionGeneration}",
+                                color = Color.White,
+                                fontSize = 9.sp
+                            )
+                        }
+                        Text(
+                            "Snapshot: ${diagnostics.snapshotTimestampMs ?: "none"} · age=${diagnostics.frameAgeMs ?: "n/a"}ms",
+                            color = Color.White,
+                            fontSize = 9.sp
+                        )
+                        Text(
+                            "Inference: inFlight=${diagnostics.inferenceInFlight} dropped=${diagnostics.droppedFrames} watchdog=${diagnostics.watchdogStatus} shutdown=${diagnostics.providerShutdownComplete}",
+                            color = Color.White,
+                            fontSize = 9.sp
+                        )
+                    }
                     if (previewDiagnostics.lastTransformFailure != null) {
                         Text(
                             "Transform error: ${previewDiagnostics.lastTransformFailure}",
@@ -285,9 +344,23 @@ fun CameraScreen(
                     }
                     if (isMeshTextureSelected) {
                         Text(
-                            "GL: ${meshGlRenderStatus} · ${meshBackendDecision.reason}",
+                            "GL: ${meshGlRenderStatus} · ${if (meshGlRenderStatus == FaceMeshGlRenderStatus.NOT_MOUNTED) {
+                                (meshEffectResolution as? FaceMeshEffectResolution.Blocked)?.reason
+                                    ?: meshEffectResolution.javaClass.simpleName
+                            } else meshBackendDecision.reason}",
                             color = Color(0xFF80DEEA),
                             fontSize = 10.sp
+                        )
+                        val surface = meshGlSurfaceDiagnostics
+                        Text(
+                            "Preview ${previewDiagnostics.previewWidth}×${previewDiagnostics.previewHeight} vs GL ${surface?.surfaceWidth ?: 0}×${surface?.surfaceHeight ?: 0}",
+                            color = Color(0xFF80DEEA),
+                            fontSize = 9.sp
+                        )
+                        Text(
+                            "Bounds: preview=${previewDiagnostics.previewBoundsInWindow} GL=${surface?.boundsInWindow}",
+                            color = Color(0xFF80DEEA),
+                            fontSize = 9.sp
                         )
                     }
                     if (cameraError != null) {
@@ -365,17 +438,19 @@ fun CameraScreen(
                         )
                     }
 
-                    // Developer Diagnostics Toggle
-                    IconButton(
-                        onClick = { showDebugOverlay = !showDebugOverlay },
-                        modifier = Modifier.size(40.dp).testTag("debug_overlay_toggle")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.BugReport,
-                            contentDescription = "Developer Overlay",
-                            tint = if (showDebugOverlay) Color(0xFFFFD54F) else Color(0xFF94A3B8),
-                            modifier = Modifier.size(20.dp)
-                        )
+                    // Developer Diagnostics Toggle (never exposed by release builds).
+                    if (BuildConfig.DEBUG) {
+                        IconButton(
+                            onClick = { showDebugOverlay = !showDebugOverlay },
+                            modifier = Modifier.size(40.dp).testTag("debug_overlay_toggle")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.BugReport,
+                                contentDescription = "Developer Overlay",
+                                tint = if (showDebugOverlay) Color(0xFFFFD54F) else Color(0xFF94A3B8),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                     }
 
                     // Camera Switch (Front / Rear)

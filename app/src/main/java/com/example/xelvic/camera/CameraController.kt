@@ -2,9 +2,14 @@ package com.example.xelvic.camera
 
 import android.content.Context
 import android.graphics.Matrix
+import android.hardware.display.DisplayManager
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.util.Size
 import android.view.View
+import android.view.ViewTreeObserver
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -12,6 +17,7 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -24,6 +30,10 @@ import androidx.core.view.doOnAttach
 import androidx.core.view.doOnLayout
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.Observer
+import com.example.BuildConfig
+import com.example.xelvic.geometry.InferenceWatchdogStatus
+import com.example.xelvic.geometry.MediaPipeFrameDiagnostics
+import com.example.xelvic.perf.DiagnosticRateLimiter
 import com.example.xelvic.geometry.FaceGeometryDisplayTransform
 import com.example.xelvic.geometry.FaceGeometrySnapshotHolder
 import com.example.xelvic.geometry.MediaPipeFaceGeometryProvider
@@ -69,8 +79,45 @@ data class CameraPreviewDiagnostics(
     val outputTransformAvailable: Boolean = false,
     val geometryTransformStatus: GeometryDisplayTransformStatus =
         GeometryDisplayTransformStatus.DISABLED,
-    val lastTransformFailure: String? = null
+    val lastTransformFailure: String? = null,
+    val configurationGeneration: Long = 0L,
+    val previewBoundsInWindow: String? = null
 )
+
+/** Read on demand by the debug panel; operational fields already live in provider/holder atomics. */
+data class CameraGeometryDiagnostics(
+    val frame: MediaPipeFrameDiagnostics?,
+    val snapshotTimestampMs: Long?,
+    val frameAgeMs: Long?,
+    val inferenceInFlight: Boolean,
+    val droppedFrames: Long,
+    val watchdogStatus: InferenceWatchdogStatus,
+    val providerShutdownComplete: Boolean
+)
+
+/** Preview properties that change its output mapping or CameraX's shared ViewPort. */
+internal data class PreviewConfiguration(
+    val width: Int,
+    val height: Int,
+    val rotation: Int,
+    val layoutDirection: Int,
+    val scaleType: PreviewView.ScaleType,
+    val implementationMode: PreviewView.ImplementationMode = PreviewView.ImplementationMode.PERFORMANCE
+) {
+    /** ViewPort uses aspect ratio, not pixel dimensions. A proportional resize needs no rebind. */
+    fun requiresUseCaseRebind(bound: PreviewConfiguration?): Boolean =
+        bound == null || rotation != bound.rotation || layoutDirection != bound.layoutDirection ||
+            viewPortScaleType(scaleType) != viewPortScaleType(bound.scaleType) ||
+            width.toLong() * bound.height != bound.width.toLong() * height
+
+    private fun viewPortScaleType(type: PreviewView.ScaleType): Int = when (type) {
+        PreviewView.ScaleType.FILL_START -> 0
+        PreviewView.ScaleType.FILL_CENTER -> 1
+        PreviewView.ScaleType.FILL_END -> 2
+        else -> 3 // CameraX maps all FIT_* variants to ViewPort.FIT.
+    }
+}
+
 @TransformExperimental
 class CameraController(
     private val context: Context,
@@ -108,7 +155,7 @@ class CameraController(
     @Volatile
     private var geometryRequested = false
 
-    /** Invalidates asynchronous MediaPipe initialization and callbacks from superseded modes. */
+    /** Provider initialization/error lifecycle only; frame publication authority is the holder token. */
     private val geometrySessionGeneration = AtomicLong(0L)
 
     @Volatile
@@ -117,19 +164,53 @@ class CameraController(
     @Volatile
     private var mediaPipeProvider: MediaPipeFaceGeometryProvider? = null
 
+    /** At most one retired native task may be draining; do not accumulate stuck graphs on re-entry. */
+    private var retiringMediaPipeProvider: MediaPipeFaceGeometryProvider? = null
     private val geometryProviderLock = Any()
+    private val previewDiagnosticLogLimiter = DiagnosticRateLimiter(1_000L)
+
+    /** No high-frequency Compose state: sample only while the debug panel is visible. */
+    fun debugGeometryDiagnostics(nowMs: Long = SystemClock.uptimeMillis()): CameraGeometryDiagnostics? {
+        if (!BuildConfig.DEBUG) return null
+        val provider = synchronized(geometryProviderLock) { mediaPipeProvider ?: retiringMediaPipeProvider }
+        val timestamp = faceGeometryHolder.getLatest()?.snapshot?.timestampMs
+        return CameraGeometryDiagnostics(
+            frame = provider?.debugFrameDiagnostics,
+            snapshotTimestampMs = timestamp,
+            frameAgeMs = timestamp?.let { nowMs - it },
+            inferenceInFlight = provider?.isInferenceInFlight ?: false,
+            droppedFrames = provider?.debugDroppedFrames ?: 0L,
+            watchdogStatus = provider?.watchdogStatus ?: InferenceWatchdogStatus.IDLE,
+            providerShutdownComplete = provider?.isShutdownComplete ?: true
+        )
+    }
 
     private fun isGeometrySessionActive(generation: Long): Boolean =
         !released && geometryRequested && geometrySessionGeneration.get() == generation
 
     private fun detachMediaPipeProvider(): MediaPipeFaceGeometryProvider? =
         synchronized(geometryProviderLock) {
-            mediaPipeProvider.also { mediaPipeProvider = null }
+            mediaPipeProvider.also { previous ->
+                mediaPipeProvider = null
+                if (previous != null) retiringMediaPipeProvider = previous
+            }
         }
 
-    private val mediaPipeAnalyzer = ImageAnalysis.Analyzer { imageProxy ->
+    private fun isRetiredProviderStillClosing(): Boolean = synchronized(geometryProviderLock) {
+        val previous = retiringMediaPipeProvider ?: return@synchronized false
+        if (previous.isShutdownComplete) {
+            retiringMediaPipeProvider = null
+            false
+        } else {
+            true
+        }
+    }
+
+    private fun mediaPipeAnalyzer(bindingGeneration: Long) = ImageAnalysis.Analyzer { imageProxy ->
         val activeProvider = mediaPipeProvider
-        if (!geometryRequested || activeProvider == null) {
+        if (!geometryRequested || activeProvider == null ||
+            previewBindingGeneration.get() != bindingGeneration
+        ) {
             try {
                 imageProxy.close()
             } catch (error: Exception) {
@@ -137,6 +218,14 @@ class CameraController(
             }
         } else {
             val frameTransform = computeGeometryDisplayTransform(imageProxy)
+            val session = frameTransform?.session
+            if (session == null || !session.isCurrent ||
+                previewBindingGeneration.get() != bindingGeneration
+            ) {
+                activeProvider.recordTransformRejectedFrame(imageProxy, session?.generation)
+                imageProxy.close()
+                return@Analyzer
+            }
             activeProvider.submitFrame(
                 imageProxy = imageProxy,
                 timestampMs = SystemClock.uptimeMillis(),
@@ -178,6 +267,20 @@ class CameraController(
     private var currentPreviewView: PreviewView? = null
     private var observedPreviewView: PreviewView? = null
     private var previewBindingInProgress = false
+    private var observedPreviewConfiguration: PreviewConfiguration? = null
+    private var boundPreviewConfiguration: PreviewConfiguration? = null
+    private var attemptedPreviewConfiguration: PreviewConfiguration? = null
+    private var previewConfigurationGeneration = 0L
+    private val previewBindingGeneration = AtomicLong(0L)
+    private var activePreviewSurfaceRequest: SurfaceRequest? = null
+    private var previewSurfaceReady = false
+    private var cachedGeometryPreviewViewPortSize: Size? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var previewPreDrawListener: ViewTreeObserver.OnPreDrawListener? = null
+    private var previewTreeObserver: ViewTreeObserver? = null
+    private var previewAttachListener: View.OnAttachStateChangeListener? = null
+    private var previewDisplayListener: DisplayManager.DisplayListener? = null
+    private val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
 
     private var previewLayoutChangeListener:
             View.OnLayoutChangeListener? = null
@@ -203,29 +306,195 @@ class CameraController(
      *
      * The analyzer thread consumes the cached value through FaceAnalyzer.
      */
+    private fun previewConfiguration(view: PreviewView): PreviewConfiguration? {
+        val rotation = view.display?.rotation ?: return null
+        if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0) return null
+        return PreviewConfiguration(
+            view.width, view.height, rotation, view.layoutDirection, view.scaleType,
+            view.implementationMode
+        )
+    }
+
+    private fun updateMediaPipeTrackingState() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { updateMediaPipeTrackingState() }
+            return
+        }
+        // Read the holder NOW, not a face boolean captured by an old callback. All UI lifecycle
+        // mutations are main-thread serialized; delayed bookkeeping cannot undo a new session.
+        _isMediaPipeFaceTracked.value = !released && faceGeometryHolder.getLatest() != null
+    }
+
+    init {
+        faceGeometryHolder.addSnapshotListener { updateMediaPipeTrackingState() }
+    }
+
+    /** UI-thread only. Retire geometry before exposing any new preview configuration. */
+    private fun invalidatePreviewGeometry() {
+        cachedGeometryPreviewTransform = null
+        cachedGeometryPreviewViewPortSize = null
+        faceGeometryHolder.clear() // Retire publication authority before any external ML Kit listener.
+        _isMediaPipeFaceTracked.value = false
+        faceAnalyzer.updatePreviewOutputTransform(null)
+        faceAnalyzer.invalidatePendingAnalysis()
+        previewConfigurationGeneration++
+        updatePreviewDiagnostics {
+            it.copy(
+                outputTransformAvailable = false,
+                configurationGeneration = previewConfigurationGeneration,
+                geometryTransformStatus = if (geometryRequested) {
+                    GeometryDisplayTransformStatus.WAITING_FOR_OUTPUT_TRANSFORM
+                } else {
+                    GeometryDisplayTransformStatus.DISABLED
+                }
+            )
+        }
+    }
+
+    /** Called by layout/display/pre-draw events, not by the analysis frame loop. */
+    private fun refreshPreviewConfiguration(view: PreviewView) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (currentPreviewView !== view) return
+        val configuration = previewConfiguration(view)
+        if (configuration != observedPreviewConfiguration) {
+            observedPreviewConfiguration = configuration
+            attemptedPreviewConfiguration = null
+            invalidatePreviewGeometry()
+            if (configuration == null || configuration.requiresUseCaseRebind(boundPreviewConfiguration)) {
+                _isCameraReady.value = false
+            }
+        }
+        if (configuration != null && cameraProvider != null && !previewBindingInProgress &&
+            configuration != attemptedPreviewConfiguration
+        ) {
+            if (configuration.requiresUseCaseRebind(boundPreviewConfiguration) || !_isCameraReady.value) {
+                rebindUseCases(view)
+            } else if (configuration.implementationMode != boundPreviewConfiguration?.implementationMode) {
+                // CameraX requires resetting only Preview's SurfaceProvider after a mode change,
+                // not rebuilding an unchanged shared ViewPort/analysis/capture configuration.
+                preview?.let { useCase ->
+                    attemptedPreviewConfiguration = configuration
+                    activePreviewSurfaceRequest = null
+                    previewSurfaceReady = false
+                    val bindingGeneration = previewBindingGeneration.get()
+                    useCase.setSurfaceProvider(ContextCompat.getMainExecutor(context)) { request ->
+                        onPreviewSurfaceRequested(view, bindingGeneration, request)
+                    }
+                    boundPreviewConfiguration = configuration
+                }
+            }
+        }
+    }
+
+    /** Compose can update scale type without changing the view's dimensions. */
+    fun onPreviewViewUpdated(view: PreviewView) {
+        refreshPreviewConfiguration(view)
+        view.post { cachePreviewTransform(view) }
+    }
+
     @TransformExperimental
     private fun cachePreviewTransform(view: PreviewView) {
+        check(Looper.myLooper() == Looper.getMainLooper())
         if (observedPreviewView !== view) return
+        refreshPreviewConfiguration(view)
 
-        val outputTransform = view.outputTransform
-        cachedGeometryPreviewTransform = outputTransform
-        faceAnalyzer.updatePreviewOutputTransform(outputTransform)
+        val configuration = previewConfiguration(view)
+        val outputTransform = if (
+            configuration != null && !configuration.requiresUseCaseRebind(boundPreviewConfiguration) &&
+            _isCameraReady.value && previewSurfaceReady &&
+            view.previewStreamState.value == PreviewView.StreamState.STREAMING
+        ) view.outputTransform else null
+        val crop = preview?.resolutionInfo?.cropRect
+        updateCachedPreviewTransform(outputTransform, crop?.let { Size(it.width(), it.height()) })
+        val snapshot = cachedGeometryPreviewTransform
         updatePreviewDiagnostics { current ->
             current.copy(
                 previewViewAttached = view.isAttachedToWindow,
                 previewWidth = view.width,
                 previewHeight = view.height,
                 viewPortAvailable = view.viewPort != null,
-                outputTransformAvailable = outputTransform != null,
+                outputTransformAvailable = snapshot != null,
                 geometryTransformStatus = when {
                     !geometryRequested -> GeometryDisplayTransformStatus.DISABLED
-                    outputTransform != null -> GeometryDisplayTransformStatus.READY
+                    snapshot != null -> GeometryDisplayTransformStatus.READY
                     current.previewStreamStatus == CameraPreviewStreamStatus.STREAMING ->
                         GeometryDisplayTransformStatus.WAITING_FOR_OUTPUT_TRANSFORM
                     else -> GeometryDisplayTransformStatus.WAITING_FOR_PREVIEW
                 },
-                lastTransformFailure = if (outputTransform != null) null else current.lastTransformFailure
+                lastTransformFailure = if (snapshot != null) null else current.lastTransformFailure,
+                previewBoundsInWindow = if (BuildConfig.DEBUG) {
+                    val location = IntArray(2)
+                    view.getLocationInWindow(location)
+                    "[${location[0]},${location[1]}..${location[0] + view.width},${location[1] + view.height}]"
+                } else null
             )
+        }
+        if (BuildConfig.DEBUG && previewDiagnosticLogLimiter.shouldReport(SystemClock.uptimeMillis())) {
+            val state = _previewDiagnostics.value
+            Log.d(TAG, "preview=${state.previewWidth}x${state.previewHeight} bounds=${state.previewBoundsInWindow} " +
+                "rotation=${configuration?.rotation} mode=${view.implementationMode} " +
+                "stream=${state.previewStreamStatus} transform=${state.geometryTransformStatus} " +
+                "configuration=${state.configurationGeneration}")
+        }
+    }
+
+    /** Copies CameraX's mutable Matrix once per change; only read-only, volatile snapshots escape. */
+    private fun updateCachedPreviewTransform(outputTransform: OutputTransform?, viewPortSize: Size?) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        val next = outputTransform?.takeIf { viewPortSize != null }
+        val previous = cachedGeometryPreviewTransform
+        val values = FloatArray(9)
+        val previousValues = FloatArray(9)
+        next?.matrix?.getValues(values)
+        previous?.matrix?.getValues(previousValues)
+        val changed = (next == null) != (previous == null) ||
+            (next != null && (!values.contentEquals(previousValues) ||
+                viewPortSize != cachedGeometryPreviewViewPortSize))
+        if (!changed) return
+
+        // Null the target before retiring its session. Analyzer capture reads the session first,
+        // so it can never pair an old target with the new publication authority.
+        invalidatePreviewGeometry()
+        val snapshot = next?.let { OutputTransform(Matrix(it.matrix), checkNotNull(viewPortSize)) }
+        cachedGeometryPreviewViewPortSize = if (snapshot != null) viewPortSize else null
+        cachedGeometryPreviewTransform = snapshot
+        faceAnalyzer.updatePreviewOutputTransform(snapshot)
+    }
+
+    /** Do not accept PreviewView's retained metadata until the current request has been applied. */
+    private fun onPreviewSurfaceRequested(
+        view: PreviewView,
+        bindingGeneration: Long,
+        request: SurfaceRequest
+    ) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (released || currentPreviewView !== view ||
+            previewBindingGeneration.get() != bindingGeneration
+        ) {
+            request.willNotProvideSurface()
+            return
+        }
+        activePreviewSurfaceRequest = request
+        previewSurfaceReady = false
+        invalidatePreviewGeometry()
+        // PreviewView owns SurfaceRequest's single transformation-info listener; never replace it.
+        view.surfaceProvider.onSurfaceRequested(request)
+        request.addRequestCancellationListener(ContextCompat.getMainExecutor(context)) {
+            if (activePreviewSurfaceRequest === request && currentPreviewView === view) {
+                activePreviewSurfaceRequest = null
+                previewSurfaceReady = false
+                invalidatePreviewGeometry()
+            }
+        }
+        // CameraX sends initial transformation info before dispatching the request. PreviewView's
+        // main-executor listener is queued before this post, which fences off the old metadata.
+        view.post {
+            if (activePreviewSurfaceRequest === request && currentPreviewView === view &&
+                previewBindingGeneration.get() == bindingGeneration
+            ) {
+                previewSurfaceReady = true
+                cachePreviewTransform(view)
+            }
         }
     }
 
@@ -234,13 +503,41 @@ class CameraController(
         if (observedPreviewView !== view) return
 
         previewLayoutChangeListener?.let(view::removeOnLayoutChangeListener)
+        previewPreDrawListener?.let { listener ->
+            previewTreeObserver?.takeIf { it.isAlive }?.removeOnPreDrawListener(listener)
+        }
+        previewAttachListener?.let(view::removeOnAttachStateChangeListener)
+        previewDisplayListener?.let { displayManager?.unregisterDisplayListener(it) }
         previewStreamStateObserver?.let(view.previewStreamState::removeObserver)
 
+        previewBindingGeneration.incrementAndGet()
+        activePreviewSurfaceRequest = null
+        previewSurfaceReady = false
         observedPreviewView = null
+        previewPreDrawListener = null
+        previewTreeObserver = null
+        previewAttachListener = null
+        previewDisplayListener = null
+        observedPreviewConfiguration = null
+        boundPreviewConfiguration = null
+        attemptedPreviewConfiguration = null
         previewLayoutChangeListener = null
         previewStreamStateObserver = null
         cachedGeometryPreviewTransform = null
+        cachedGeometryPreviewViewPortSize = null
         faceAnalyzer.updatePreviewOutputTransform(null)
+    }
+
+    /** Register on the attached tree, not a floating observer that becomes dead on first attach. */
+    private fun attachPreviewPreDrawObserver(view: PreviewView) {
+        if (!view.isAttachedToWindow) return
+        val observer = view.viewTreeObserver
+        if (previewTreeObserver === observer) return
+        previewPreDrawListener?.let { listener ->
+            previewTreeObserver?.takeIf { it.isAlive }?.removeOnPreDrawListener(listener)
+            observer.addOnPreDrawListener(listener)
+        }
+        previewTreeObserver = observer
     }
 
     /**
@@ -284,23 +581,53 @@ class CameraController(
         val layoutListener = View.OnLayoutChangeListener {
                 _, _, _, _, _, _, _, _, _ ->
 
-            cachePreviewTransform(view)
-            if (
-                currentPreviewView === view &&
-                cameraProvider != null &&
-                !_isCameraReady.value &&
-                !previewBindingInProgress &&
-                view.isAttachedToWindow &&
-                view.width > 0 &&
-                view.height > 0 &&
-                view.viewPort != null
-            ) {
-                rebindUseCases(view)
-            }
+            refreshPreviewConfiguration(view)
+            view.post { cachePreviewTransform(view) }
         }
 
         previewLayoutChangeListener = layoutListener
         view.addOnLayoutChangeListener(layoutListener)
+        // PreviewView owns SurfaceRequest's single transformation-info listener. Its redraws
+        // invalidate the UI traversal; observe that boundary without replacing its listener or
+        // polling from ImageAnalysis. Comparison suppresses redundant rebinds/invalidation.
+        previewPreDrawListener = ViewTreeObserver.OnPreDrawListener {
+            cachePreviewTransform(view)
+            true
+        }
+        attachPreviewPreDrawObserver(view)
+        previewAttachListener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(attached: View) {
+                if (currentPreviewView !== view) return
+                attachPreviewPreDrawObserver(view)
+                refreshPreviewConfiguration(view)
+                viewRefresh(view)
+            }
+
+            override fun onViewDetachedFromWindow(detached: View) {
+                if (currentPreviewView !== view) return
+                previewPreDrawListener?.let { listener ->
+                    previewTreeObserver?.takeIf { it.isAlive }?.removeOnPreDrawListener(listener)
+                }
+                previewTreeObserver = null
+                previewBindingGeneration.incrementAndGet()
+                activePreviewSurfaceRequest = null
+                previewSurfaceReady = false
+                boundPreviewConfiguration = null
+                attemptedPreviewConfiguration = null
+                _isCameraReady.value = false
+                invalidatePreviewGeometry()
+            }
+        }.also(view::addOnAttachStateChangeListener)
+        previewDisplayListener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = Unit
+            override fun onDisplayRemoved(displayId: Int) = Unit
+            override fun onDisplayChanged(displayId: Int) {
+                if (view.display?.displayId == displayId) {
+                    refreshPreviewConfiguration(view)
+                    view.post { cachePreviewTransform(view) }
+                }
+            }
+        }.also { displayManager?.registerDisplayListener(it, mainHandler) }
 
         val streamObserver =
             Observer<PreviewView.StreamState> { state ->
@@ -330,12 +657,7 @@ class CameraController(
                     // Invalidate stale geometry synchronously with the stream transition.
                     // A late frame may still complete, but it cannot use this retired target transform.
                     if (observedPreviewView === view) {
-                        cachedGeometryPreviewTransform = null
-                        faceAnalyzer.updatePreviewOutputTransform(null)
-                        faceAnalyzer.invalidatePendingAnalysis()
-                        mediaPipeProvider?.invalidatePendingFrames()
-                        faceGeometryHolder.clear()
-                        _isMediaPipeFaceTracked.value = false
+                        invalidatePreviewGeometry()
                     }
                 }
             }
@@ -419,10 +741,7 @@ class CameraController(
         }
         faceAnalyzer.previewWidth = 0
         faceAnalyzer.previewHeight = 0
-        faceAnalyzer.invalidatePendingAnalysis()
-        mediaPipeProvider?.invalidatePendingFrames()
-        faceGeometryHolder.clear()
-        _isMediaPipeFaceTracked.value = false
+        invalidatePreviewGeometry()
 
         try {
             imageAnalysis?.clearAnalyzer()
@@ -448,6 +767,7 @@ class CameraController(
                 previewViewAttached = false,
                 previewWidth = 0,
                 previewHeight = 0,
+                previewBoundsInWindow = null,
                 viewPortAvailable = false,
                 useCasesBound = false,
                 outputTransformAvailable = false,
@@ -502,8 +822,16 @@ class CameraController(
             return
         }
 
+        val configuration = previewConfiguration(previewView) ?: return
+        if (_isCameraReady.value && !configuration.requiresUseCaseRebind(boundPreviewConfiguration)) return
+        attemptedPreviewConfiguration = configuration
+        val bindingGeneration = previewBindingGeneration.incrementAndGet()
+        activePreviewSurfaceRequest = null
+        previewSurfaceReady = false
         previewBindingInProgress = true
         try {
+            _isCameraReady.value = false
+            invalidatePreviewGeometry()
             updatePreviewDiagnostics {
                 it.copy(viewPortAvailable = true, useCasesBound = false)
             }
@@ -531,15 +859,17 @@ class CameraController(
 
             // 1. Preview use case
             preview = Preview.Builder()
+                .setTargetRotation(configuration.rotation)
                 .build()
                 .also { previewUseCase ->
-                    previewUseCase.setSurfaceProvider(
-                        previewView.surfaceProvider
-                    )
+                    previewUseCase.setSurfaceProvider(ContextCompat.getMainExecutor(context)) { request ->
+                        onPreviewSurfaceRequested(previewView, bindingGeneration, request)
+                    }
                 }
 
             // 2. Image analysis use case
             imageAnalysis = ImageAnalysis.Builder()
+                .setTargetRotation(configuration.rotation)
                 .setTargetResolution(android.util.Size(480, 640))
                 .setBackpressureStrategy(
                     ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
@@ -554,12 +884,13 @@ class CameraController(
 
                     analysisUseCase.setAnalyzer(
                         cameraExecutor,
-                        activeImageAnalyzer()
+                        activeImageAnalyzer(bindingGeneration)
                     )
                 }
 
             // 3. Image capture use case
             imageCapture = ImageCapture.Builder()
+                .setTargetRotation(configuration.rotation)
                 .setOutputFormat(ImageCapture.OUTPUT_FORMAT_JPEG)
                 .setCaptureMode(
                     ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
@@ -602,6 +933,8 @@ class CameraController(
                     resolution
             }
 
+            boundPreviewConfiguration = configuration
+            observedPreviewConfiguration = configuration
             _isCameraReady.value = true
             _cameraError.value = null
             updatePreviewDiagnostics {
@@ -639,6 +972,8 @@ class CameraController(
     private fun computeGeometryDisplayTransform(
         imageProxy: ImageProxy
     ): FaceGeometryDisplayTransform? {
+        // Capture authority before the target: invalidation nulls the target before retiring it.
+        val session = faceGeometryHolder.currentSession()
         val targetTransform = cachedGeometryPreviewTransform
         if (targetTransform == null) {
             updatePreviewDiagnostics { current ->
@@ -674,7 +1009,7 @@ class CameraController(
                     lastTransformFailure = null
                 )
             }
-            FaceGeometryDisplayTransform(values.map { it })
+            FaceGeometryDisplayTransform(values.map { it }, session)
         } catch (error: Exception) {
             val failure = "${error.javaClass.simpleName}: ${error.message ?: "transform creation failed"}"
             updatePreviewDiagnostics {
@@ -710,6 +1045,12 @@ class CameraController(
      * ML Kit and MediaPipe simultaneously. The production ML Kit path remains the default.
      */
     fun setMediaPipeGeometryEnabled(enabled: Boolean) {
+        // Serialize mode/init/error transitions on main. Holder publication remains lock-free
+        // on MediaPipe's callback thread; native close remains off the camera executor.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { setMediaPipeGeometryEnabled(enabled) }
+            return
+        }
         if (released) return
 
         if (!enabled) {
@@ -729,8 +1070,8 @@ class CameraController(
 
             val previousProvider = detachMediaPipeProvider()
             try {
-                // Analyzer replacement and FaceLandmarker.close() are serialized with any
-                // initialization already running on this executor.
+                // Analyzer replacement is serialized with queued conversion/initialization.
+                // Provider.close() retires now and schedules potentially blocking native drain.
                 cameraExecutor.execute {
                     imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
                     previousProvider?.close()
@@ -742,6 +1083,12 @@ class CameraController(
         }
 
         if (geometryRequested || _isMediaPipeGeometryEnabled.value) return
+        if (isRetiredProviderStillClosing()) {
+            _geometryError.value =
+                "The previous MediaPipe task is still shutting down; ML Kit remains active. " +
+                    "Mesh tracking can be retried after shutdown completes."
+            return
+        }
 
         val sessionGeneration = geometrySessionGeneration.incrementAndGet()
         geometryRequested = true
@@ -765,14 +1112,21 @@ class CameraController(
             cameraExecutor.execute {
                 var candidate: MediaPipeFaceGeometryProvider? = null
                 try {
+                    if (!isGeometrySessionActive(sessionGeneration)) return@execute
+                    if (isRetiredProviderStillClosing()) {
+                        fallbackToMlKitOnGeometryError(
+                            IllegalStateException("Previous MediaPipe task has not confirmed shutdown"),
+                            sessionGeneration
+                        )
+                        return@execute
+                    }
                     candidate = MediaPipeFaceGeometryProvider(context.applicationContext)
-                    candidate.setResultListener { snapshot, displayTransform ->
+                    candidate.setSessionResultListener { snapshot, displayTransform, timestampMs ->
                         if (isGeometrySessionActive(sessionGeneration)) {
-                            faceGeometryHolder.publish(snapshot, displayTransform)
-                            val hasFace = snapshot != null
-                            if (_isMediaPipeFaceTracked.value != hasFace) {
-                                _isMediaPipeFaceTracked.value = hasFace
-                            }
+                            val session = displayTransform?.session ?: return@setSessionResultListener
+                            // The lifecycle check is only an optimization. Publication/retirement
+                            // ordering is the holder's CAS, not a check followed by an unsafe set.
+                            faceGeometryHolder.publishIfCurrent(session, snapshot, displayTransform, timestampMs)
                         }
                     }
                     candidate.setErrorListener { error ->
@@ -791,10 +1145,14 @@ class CameraController(
                         }
                     }
                     if (!installed) {
+                        synchronized(geometryProviderLock) { retiringMediaPipeProvider = candidate }
                         candidate.close()
                         return@execute
                     }
-                    providerToReplace?.close()
+                    providerToReplace?.let { previous ->
+                        synchronized(geometryProviderLock) { retiringMediaPipeProvider = previous }
+                        previous.close()
+                    }
 
                     // A disable can race after installation. Its queued analyzer restoration runs
                     // after this task, while this final generation check prevents stale analyzer
@@ -804,48 +1162,27 @@ class CameraController(
                         imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
                         return@execute
                     }
-                    imageAnalysis?.setAnalyzer(cameraExecutor, mediaPipeAnalyzer)
+                    imageAnalysis?.setAnalyzer(cameraExecutor, activeImageAnalyzer())
                     Log.i(TAG, "MediaPipe geometry diagnostics enabled")
                 } catch (error: Exception) {
                     candidate?.close()
-                    if (geometrySessionGeneration.compareAndSet(
-                            sessionGeneration,
-                            sessionGeneration + 1L
-                        )
-                    ) {
-                        geometryRequested = false
-                        detachMediaPipeProvider()?.close()
-                        _isMediaPipeGeometryEnabled.value = false
-                        _isMediaPipeFaceTracked.value = false
-                        faceGeometryHolder.clear()
-                        _geometryError.value =
-                            "Could not start MediaPipe: ${error.message ?: error.javaClass.simpleName}"
-                        imageAnalysis?.setAnalyzer(cameraExecutor, faceAnalyzer)
-                        Log.e(TAG, "Could not start MediaPipe geometry diagnostics", error)
-                    }
+                    fallbackToMlKitOnGeometryError(error, sessionGeneration)
                 }
             }
         } catch (error: Exception) {
-            if (geometrySessionGeneration.compareAndSet(
-                    sessionGeneration,
-                    sessionGeneration + 1L
-                )
-            ) {
-                geometryRequested = false
-                _isMediaPipeGeometryEnabled.value = false
-                _geometryError.value = "Camera analysis executor is unavailable"
-                Log.e(TAG, "Could not schedule MediaPipe initialization", error)
-            }
+            fallbackToMlKitOnGeometryError(error, sessionGeneration)
         }
     }
 
-    private fun activeImageAnalyzer(): ImageAnalysis.Analyzer =
+    private fun activeImageAnalyzer(
+        bindingGeneration: Long = previewBindingGeneration.get()
+    ): ImageAnalysis.Analyzer =
         if (
             geometryRequested &&
             _isMediaPipeGeometryEnabled.value &&
             mediaPipeProvider != null
         ) {
-            mediaPipeAnalyzer
+            mediaPipeAnalyzer(bindingGeneration)
         } else {
             faceAnalyzer
         }
@@ -858,7 +1195,11 @@ class CameraController(
         error: Throwable,
         sessionGeneration: Long
     ) {
-        if (!geometrySessionGeneration.compareAndSet(
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { fallbackToMlKitOnGeometryError(error, sessionGeneration) }
+            return
+        }
+        if (released || !geometrySessionGeneration.compareAndSet(
                 sessionGeneration,
                 sessionGeneration + 1L
             )
@@ -868,6 +1209,7 @@ class CameraController(
         _isMediaPipeGeometryEnabled.value = false
         _isMediaPipeFaceTracked.value = false
         faceGeometryHolder.clear()
+        faceAnalyzer.invalidatePendingAnalysis()
         _geometryError.value =
             "MediaPipe failed; returned to ML Kit: ${error.message ?: error.javaClass.simpleName}"
         updatePreviewDiagnostics {
@@ -916,14 +1258,10 @@ class CameraController(
 
             _isFrontCamera.value = newFacing
             faceAnalyzer.isFrontCamera = newFacing
-            faceGeometryHolder.clear()
-            _isMediaPipeFaceTracked.value = false
-
+            _isCameraReady.value = false
             // Drop transform and in-flight geometry from the previous camera configuration.
-            cachedGeometryPreviewTransform = null
-            faceAnalyzer.updatePreviewOutputTransform(null)
-            faceAnalyzer.invalidatePendingAnalysis()
-            mediaPipeProvider?.invalidatePendingFrames()
+            attemptedPreviewConfiguration = null
+            invalidatePreviewGeometry()
 
             currentPreviewView?.let { view ->
                 if (!previewBindingInProgress) {
@@ -1047,6 +1385,7 @@ class CameraController(
                     previewViewAttached = false,
                     previewWidth = 0,
                     previewHeight = 0,
+                    previewBoundsInWindow = null,
                     viewPortAvailable = false,
                     useCasesBound = false,
                     outputTransformAvailable = false,

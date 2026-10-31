@@ -11,9 +11,12 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
+// LEGACY bitmap shadows leave non-identity matrix outputs blank instead of rendering pixels.
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class CaptureCropTransformTest {
 
     @Test
