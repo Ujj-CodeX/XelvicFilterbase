@@ -43,4 +43,29 @@ jobs:
           gradle-version: '9.3.1'
 
       - name: Run unit tests
-        run: gradle --no-daemon testDebugUnitTest
+        shell: bash
+        run: |
+          set +e
+          gradle --no-daemon testDebugUnitTest
+          test_status=$?
+
+          if [ "$test_status" -ne 0 ]; then
+            echo "::group::JUnit failure details"
+            python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+
+          for report in glob.glob("app/build/test-results/testDebugUnitTest/*.xml"):
+              root = ET.parse(report).getroot()
+              for case in root.iter("testcase"):
+                  failures = [child for child in list(case) if child.tag in ("failure", "error")]
+                  for failure in failures:
+                      print(f"{case.attrib.get('classname')}::{case.attrib.get('name')}")
+                      print(f"Type: {failure.attrib.get('type')}")
+                      print(f"Message: {failure.attrib.get('message')}")
+                      print(failure.text or "")
+          PY
+            echo "::endgroup::"
+          fi
+
+          exit "$test_status"
